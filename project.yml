@@ -151,8 +151,10 @@ targets:
     sources:
       - MacTests
       - Mac/DisplayArrangement.swift
+      - Mac/StreamConfiguration.swift
       - Mac/Log.swift
       - Mac/LogPolicies.swift
+      - Shared/Protocol.swift
       - Shared/LogSnapshot.swift
     settings:
       base:

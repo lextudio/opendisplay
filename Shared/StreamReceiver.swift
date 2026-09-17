@@ -209,6 +209,7 @@ final class StreamReceiver: ObservableObject {
     private(set) var devicePixelsWide = 0
     private(set) var devicePixelsHigh = 0
     var deviceScale: Double = 2
+    private var displayMaxFrameRate = 60
     // Name advertised over Bonjour for the Mac's WiFi picker. iOS 16+ returns
     // a generic "iPhone" from UIDevice.current.name (the user-assigned name
     // needs an entitlement Apple gates behind approval and personal teams
@@ -291,6 +292,14 @@ final class StreamReceiver: ObservableObject {
         devicePixelsWide = w
         devicePixelsHigh = h
         Log.info("panel changed -> \(w)x\(h) @\(scale)x")
+        if let connection { sendHello(on: connection) }
+    }
+
+    /// Physical presentation ceiling, separate from decoder capability.
+    func setDisplayMaxFrameRate(_ framesPerSecond: Int) {
+        let value = max(1, framesPerSecond)
+        guard value != displayMaxFrameRate else { return }
+        displayMaxFrameRate = value
         if let connection { sendHello(on: connection) }
     }
 
@@ -776,6 +785,19 @@ final class StreamReceiver: ObservableObject {
                 let msg = "The OpenDisplay app on your Mac is too old for this \(deviceKind) app. Update OpenDisplay on your Mac to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
             }
+        case WireMessage.streamConfig:
+            // H.264 remains implicit for old senders. New senders announce the
+            // operating point so future codecs never have to be guessed from
+            // the first binary frame.
+            let codec = (obj["codec"] as? String)?.lowercased() ?? "h264"
+            guard codec == "h264" else {
+                Log.info("unsupported stream codec selected: \(codec)")
+                return
+            }
+            let width = obj["width"] as? Int ?? 0
+            let height = obj["height"] as? Int ?? 0
+            let fps = obj["framesPerSecond"] as? Int ?? 0
+            Log.info("stream configuration: H.264 \(width)x\(height) @\(fps)fps")
         case WireMessage.updateRequired:
             // The Mac refuses this pairing until we update from the App Store.
             let message = obj["message"] as? String
@@ -836,7 +858,16 @@ final class StreamReceiver: ObservableObject {
             "device": deviceKind,
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
+            "displayMaxFrameRate": displayMaxFrameRate,
         ]
+        // Additive joint capability. The legacy rectangle below stays on the
+        // wire while independently updated senders remain in the field.
+        var h264: [String: Any] = ["codec": "h264", "maxFrameRate": 60]
+        if let maxEncodeWide, let maxEncodeHigh {
+            h264["maxWidth"] = maxEncodeWide
+            h264["maxHeight"] = maxEncodeHigh
+        }
+        hello["videoCaps"] = [h264]
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
         if cursorListenerReady { hello["cursorPort"] = Int(cursorPort) }
