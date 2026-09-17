@@ -205,6 +205,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Escape hatch: `defaults write com.peetzweg.opensidecar.mac localCursor -bool false`.
     private let localCursor = UserDefaults.standard.object(forKey: "localCursor") == nil
         || UserDefaults.standard.bool(forKey: "localCursor")
+    // Cursor sampling must not share ScreenCaptureKit's serial callback queue:
+    // a 4K encode submission can otherwise delay the next poll long before the
+    // dedicated UDP channel gets a chance to help. Sampling lives here; only
+    // confirmed UDP positions leave directly from this queue, independent of
+    // capture, encoding, and TCP video delivery.
+    private let cursorQueue = DispatchQueue(label: "sender.cursor", qos: .userInteractive)
     private var cursorTimer: DispatchSourceTimer?
     private var cursorImageTimer: DispatchSourceTimer?
     // Cable upgrade (PROTOCOL.md 6.4): while a WiFi session runs, probe the
@@ -242,7 +248,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // frames on the shared TCP socket and stutter under head-of-line
     // blocking. Opened when hello advertises cursorPort; while ready,
     // pollCursorPosition sends there instead. Sprites stay on TCP (up to
-    // 24 KB, must arrive intact). All state lives on `queue`.
+    // 24 KB, must arrive intact). Network state lives on `queue`; position
+    // sampling, sequencing, and `lastCursorSent` live on `cursorQueue`.
+    // The lock only publishes UDP readiness across those two queues.
+    private let cursorNetworkLock = NSLock()
     private var cursorConnection: NWConnection?
     private var cursorChannelPort: NWEndpoint.Port?
     // True once the receiver acked a datagram (cursorAck). Until then every
@@ -882,7 +891,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         captureDisplayID = display.displayID
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
-        lastCursorSent = (-1, -1, false)
         startCursorEcho()
         // A capture that came back through any path (recovery, rotation,
         // identity fallback) earns the full recovery budget again — without
@@ -898,8 +906,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() {
         stopped = true
         invalidateCapturePipeline(discardingLastFrame: true)
-        cursorTimer?.cancel()
-        cursorTimer = nil
+        stopCursorPositionEcho()
         cursorImageTimer?.cancel()
         cursorImageTimer = nil
         stream?.stopCapture { _ in }
@@ -1181,7 +1188,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func becomeReady(_ conn: NWConnection) {
         Log.info("connection ready to \(endpointName)")
         connectionGeneration &+= 1
-        cursorSeq = 0   // per-session; the receiver rewound its floor with the connection
+        // Per-session; the receiver rewound its floor with the connection.
+        // Keep both cursor-side resets on the cursor queue so reconnects do
+        // not race the 120 Hz sampler.
+        cursorQueue.async {
+            self.cursorSeq = 0
+            self.lastCursorSent = (-1, -1, false)
+        }
         everConnected = true
         awaitingWake = false
         consecutiveRefusals = 0
@@ -1204,7 +1217,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // changes it. Reset the dedup state to re-send sprite + position to
         // the fresh peer — the cursor analogue of forcing a keyframe.
         lastCursorPNGHash = 0
-        lastCursorSent = (-1, -1, false)
         lastReceived = Date()  // fresh grace period for the watchdog
         // An established connection whose interface vanishes does NOT get a
         // .failed/.waiting state update — NW keeps it and flags it non-viable
@@ -1656,13 +1668,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func startCursorEcho() {
         guard localCursor else { return }
-        cursorTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(8))   // 120Hz
-        timer.setEventHandler { [weak self] in self?.pollCursorPosition() }
-        timer.resume()
-        cursorTimer = timer
+        let displayID = captureDisplayID
+        cursorQueue.async { [weak self] in
+            guard let self else { return }
+            self.cursorTimer?.cancel()
+            self.lastCursorSent = (-1, -1, false)
+            let timer = DispatchSource.makeTimerSource(queue: self.cursorQueue)
+            timer.schedule(deadline: .now(), repeating: .milliseconds(8))   // 120Hz
+            timer.setEventHandler { [weak self] in
+                self?.pollCursorPosition(displayID: displayID)
+            }
+            timer.resume()
+            self.cursorTimer = timer
+        }
         scheduleCursorImagePoll()
+    }
+
+    private func stopCursorPositionEcho() {
+        cursorQueue.async { [weak self] in
+            self?.cursorTimer?.cancel()
+            self?.cursorTimer = nil
+        }
     }
 
     /// Sprite changes (arrow ↔ I-beam ↔ resize…) must land fast or the wrong
@@ -1686,10 +1712,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorImageTimer = timer
     }
 
-    private func pollCursorPosition() {
-        guard connectionReady, captureDisplayID != 0,
+    private func pollCursorPosition(displayID: CGDirectDisplayID) {
+        guard !stopped, displayID != 0,
               let loc = CGEvent(source: nil)?.location else { return }
-        let bounds = CGDisplayBounds(captureDisplayID)
+        let bounds = CGDisplayBounds(displayID)
         guard bounds.width > 0, bounds.height > 0 else { return }
         if bounds.contains(loc) {
             let x = (loc.x - bounds.minX) / bounds.width
@@ -1712,12 +1738,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func sendCursor(_ fields: String) {
         cursorSeq &+= 1
         let message = "{\"type\":\"cursor\",\(fields),\"s\":\(cursorSeq)}"
-        if let cursorConnection, cursorConnectionReady {
-            cursorConnection.send(content: Data(message.utf8),
-                                  completion: .contentProcessed { _ in })
-            if cursorChannelConfirmed { return }
+        cursorNetworkLock.lock()
+        let udp = cursorConnection
+        let udpReady = cursorConnectionReady
+        let udpConfirmed = cursorChannelConfirmed
+        cursorNetworkLock.unlock()
+        if let udp, udpReady {
+            udp.send(content: Data(message.utf8), completion: .contentProcessed { _ in })
+            if udpConfirmed { return }
         }
-        sendJSONFrame(message)
+        // Before the UDP ack (and whenever UDP is unavailable), retain the
+        // established TCP fallback. Its queue may be busy with video, but a
+        // confirmed side channel never takes this path.
+        queue.async { [weak self] in self?.sendJSONFrame(message) }
     }
 
     /// Dial the receiver's UDP cursor port (must be called on `queue`). WiFi
@@ -1732,7 +1765,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             closeCursorChannel()
             return
         }
-        if let existing = cursorConnection, cursorChannelPort == udpPort {
+        cursorNetworkLock.lock()
+        let existing = cursorConnection
+        let existingPort = cursorChannelPort
+        cursorNetworkLock.unlock()
+        if let existing, existingPort == udpPort {
             switch existing.state {
             case .failed, .cancelled: break   // dead flow, dial again below
             default: return   // rotation re-hello: keep the flow and its sequence
@@ -1747,31 +1784,50 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let params = NWParameters.udp
         params.serviceClass = .responsiveData
         let udp = NWConnection(host: host, port: udpPort, using: params)
+        cursorNetworkLock.lock()
         cursorConnection = udp
         cursorChannelPort = udpPort
+        cursorNetworkLock.unlock()
         // cursorSeq is session-scoped (reset in becomeReady), not per flow:
         // TCP frames carry the same sequence, and a flow-local restart would
         // read as stale against a floor the TCP path already advanced.
         udp.stateUpdateHandler = { [weak self] state in
-            guard let self, self.cursorConnection === udp else { return }
+            guard let self else { return }
+            self.cursorNetworkLock.lock()
+            let isCurrent = self.cursorConnection === udp
+            if isCurrent {
+                switch state {
+                case .ready: self.cursorConnectionReady = true
+                case .failed, .waiting, .cancelled: self.cursorConnectionReady = false
+                default: break
+                }
+            }
+            self.cursorNetworkLock.unlock()
+            guard isCurrent else { return }
             switch state {
             case .ready:
-                self.cursorConnectionReady = true
                 Log.info("cursor channel ready: udp \(host):\(udpPort)")
                 // Probe immediately: positions only flow while the cursor is
                 // on the captured display, which can be minutes away — the
                 // ack round-trip must not wait for that.
-                if self.lastCursorSent.visible {
-                    self.sendCursor(String(format: "\"x\":%.4f,\"y\":%.4f,\"v\":1",
-                                           self.lastCursorSent.x, self.lastCursorSent.y))
-                } else {
-                    self.sendCursor("\"v\":0")
+                self.cursorQueue.async { [weak self] in
+                    guard let self else { return }
+                    if self.lastCursorSent.visible {
+                        self.sendCursor(String(format: "\"x\":%.4f,\"y\":%.4f,\"v\":1",
+                                              self.lastCursorSent.x, self.lastCursorSent.y))
+                    } else {
+                        self.sendCursor("\"v\":0")
+                    }
                 }
                 // No ack = nobody is listening (firewall, dead listener):
                 // drop the channel and let the TCP fallback carry on.
                 self.queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-                    guard let self, self.cursorConnection === udp,
-                          !self.cursorChannelConfirmed else { return }
+                    guard let self else { return }
+                    self.cursorNetworkLock.lock()
+                    let unconfirmed = self.cursorConnection === udp
+                        && !self.cursorChannelConfirmed
+                    self.cursorNetworkLock.unlock()
+                    guard unconfirmed else { return }
                     Log.info("cursor channel: no ack after 3s — staying on TCP")
                     self.closeCursorChannel()
                 }
@@ -1780,9 +1836,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.closeCursorChannel()
             case .waiting(let error):
                 Log.info("cursor channel waiting: \(error), cursor stays on TCP")
-                self.cursorConnectionReady = false
-            case .cancelled:
-                self.cursorConnectionReady = false
+            case .cancelled: break
             default:
                 break
             }
@@ -1791,11 +1845,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func closeCursorChannel() {
+        cursorNetworkLock.lock()
+        let oldConnection = cursorConnection
         cursorChannelConfirmed = false
         cursorConnectionReady = false
-        cursorConnection?.cancel()
         cursorConnection = nil
         cursorChannelPort = nil
+        cursorNetworkLock.unlock()
+        oldConnection?.cancel()
     }
 
     private func pollCursorImage() {
@@ -1892,8 +1949,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case "cursorAck":
             // The receiver saw our first datagram: the side channel delivers,
             // stop mirroring positions onto TCP (PROTOCOL.md 6.3).
-            if cursorConnection != nil, !cursorChannelConfirmed {
-                cursorChannelConfirmed = true
+            cursorNetworkLock.lock()
+            let becameConfirmed = cursorConnection != nil && !cursorChannelConfirmed
+            if becameConfirmed { cursorChannelConfirmed = true }
+            cursorNetworkLock.unlock()
+            if becameConfirmed {
                 Log.info("cursor channel confirmed by the receiver")
             }
         case "hello":
