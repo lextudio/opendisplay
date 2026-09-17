@@ -838,7 +838,11 @@ final class StreamReceiver: ObservableObject {
         lastFrameAt = nil
         frameIntervals.removeAll()
         decodeFlushes = 0
-        displayLayer.flush()
+        // The normal AVSampleBufferDisplayLayer path must never inherit the
+        // previous session's last frame. The cursor is a separate channel, so
+        // retaining that image can otherwise look like a live desktop even
+        // when video setup failed.
+        displayLayer.flushAndRemoveImage()
         if let session = decompressionSession {
             VTDecompressionSessionInvalidate(session)
             decompressionSession = nil
@@ -1091,7 +1095,7 @@ final class StreamReceiver: ObservableObject {
             }
         }
         if formatDesc == nil, let sps, let pps {
-            displayLayer.flush()   // drop any frames from the previous format
+            displayLayer.flushAndRemoveImage()   // drop the previous format's last image
             buildFormatDescription(sps: sps, pps: pps)
         }
         guard !vclNALUs.isEmpty else { return }

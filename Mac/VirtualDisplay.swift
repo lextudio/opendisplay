@@ -6,6 +6,11 @@ import CoreGraphics
 /// W×H gets a virtual display of (W/2)×(H/2) points backed by a W×H framebuffer.
 final class VirtualDisplay {
 
+    // CGVirtualDisplay's descriptor ceiling is immutable even though its mode
+    // list can be replaced. Keep defensive 8K headroom in addition to the
+    // requested capacity supplied by the canvas plan.
+    private static let reservedPixelsPerAxis = 8_192
+
     private let display: CGVirtualDisplay
     private var settings: CGVirtualDisplaySettings
     private let maxPointsPerAxis: Int
@@ -26,16 +31,21 @@ final class VirtualDisplay {
     /// `restoreOrigin` overrides that saved arrangement (see manageOrigin);
     /// `onOriginChange` reports where the display sits afterwards, so the
     /// caller can persist user drags.
-    init?(name: String, pointsWide: Int, pointsHigh: Int, sizeInMillimeters: CGSize,
+    init?(name: String, pointsWide: Int, pointsHigh: Int,
+          descriptorMaxPixelsPerAxis: Int, sizeInMillimeters: CGSize,
           serialNum: UInt32 = 0x0001, productID: UInt32 = 0x4F53,
           restoreOrigin: CGPoint? = nil,
           onOriginChange: ((CGPoint, CGSize) -> Void)? = nil) {
         self.pointsWide = pointsWide
         self.pointsHigh = pointsHigh
-        // Reserve the longer orientation on both axes. That lets a phone or
-        // tablet change orientation by applying a new mode to this *same*
-        // virtual monitor instead of removing it and stranding its windows.
-        maxPointsPerAxis = max(pointsWide, pointsHigh)
+        // Reserve the longer orientation on both axes. The fixed headroom also
+        // covers later receiver scaling changes (for example Larger Text to
+        // More Space) without destroying and recreating the virtual display.
+        let initialPixelsPerAxis = max(pointsWide, pointsHigh) * 2
+        let maximumPixelsPerAxis = max(initialPixelsPerAxis,
+                                       descriptorMaxPixelsPerAxis,
+                                       Self.reservedPixelsPerAxis)
+        maxPointsPerAxis = (maximumPixelsPerAxis + 1) / 2
         self.restoreTarget = restoreOrigin
         self.restoreUntil = restoreOrigin == nil ? .distantPast : Date().addingTimeInterval(6)
         self.onOriginChange = onOriginChange

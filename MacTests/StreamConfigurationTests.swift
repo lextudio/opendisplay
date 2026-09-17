@@ -95,6 +95,24 @@ final class StreamConfigurationTests: XCTestCase {
             }
     }
 
+    func testCapabilityTooSmallForEvenVideoIsRejected() {
+        XCTAssertThrowsError(try H264StreamConfiguration.make(
+            source: PixelSize(width: 1920, height: 1080), quality: .best,
+            receiverCapabilities: [VideoCapability(codec: "h264", maxWidth: 1)])) { error in
+                XCTAssertEqual(error as? H264StreamConfiguration.SelectionError,
+                               .noCompatibleConfiguration)
+            }
+    }
+
+    func testLegacyCeilingTooSmallForEvenVideoIsRejected() {
+        XCTAssertThrowsError(try H264StreamConfiguration.make(
+            source: PixelSize(width: 1920, height: 1080), quality: .best,
+            legacyCeiling: PixelSize(width: 1, height: 1080))) { error in
+                XCTAssertEqual(error as? H264StreamConfiguration.SelectionError,
+                               .noCompatibleConfiguration)
+            }
+    }
+
     func testMissingCapabilitiesRetainLegacyH264() throws {
         let config = try H264StreamConfiguration.make(
             source: PixelSize(width: 1920, height: 1080), quality: .best)

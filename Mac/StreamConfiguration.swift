@@ -106,6 +106,17 @@ struct H264StreamConfiguration: Equatable {
         }
 
         let candidates = h264Capabilities.compactMap { capability -> Self? in
+            if let ceiling = legacyCeiling,
+               ceiling.width < 2 || ceiling.height < 2 {
+                return nil
+            }
+            if let capability,
+               capability.maxWidth.map({ $0 < 2 }) == true
+                || capability.maxHeight.map({ $0 < 2 }) == true
+                || capability.maxFrameRate.map({ $0 < 1 }) == true
+                || capability.maxPixelsPerSecond.map({ $0 < 4 }) == true {
+                return nil
+            }
             var size = fit(scaled, inside: legacyCeiling)
             if let capability {
                 size = fit(size, maxWidth: capability.maxWidth,
