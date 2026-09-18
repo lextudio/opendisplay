@@ -153,13 +153,23 @@ final class VirtualDisplay {
         return true
     }
 
-    /// Returns true when the display is (now) in its HiDPI mode. Silent when
-    /// nothing needed doing — this runs every 2s as enforcement. With
-    /// `recover`, a missing @2x mode (macOS can replace the whole mode list
-    /// when it restores saved display state) re-applies our settings to
-    /// publish it again instead of failing silently forever.
+    /// Returns true when the display is (now) in its HiDPI mode, or when there
+    /// is nothing left to try for now. Silent when nothing needed doing — this
+    /// runs every 2s as enforcement. With `recover`, a missing @2x mode (macOS
+    /// can replace the whole mode list when it restores saved display state)
+    /// re-applies our settings to publish it again instead of failing silently
+    /// forever.
+    ///
+    /// macOS lists but refuses some small @2x modes (a 750×1334 phone panel
+    /// asks for 374×666pt and gets kCGErrorFailure every time; the display
+    /// then runs at 1x). Without a back-off the 200ms settling loop would
+    /// issue a failing permanent reconfiguration five times a second for the
+    /// whole session and flood the log, which is what happened before this
+    /// counter existed. After a few refusals we report it once, let the loop
+    /// settle, and probe again only occasionally in case the mode list changes.
     @discardableResult
     private func selectHiDPIMode(recover: Bool = false) -> Bool {
+        guard Date() >= hidpiRetryAfter else { return true }
         let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
         guard let modes = CGDisplayCopyAllDisplayModes(display.displayID, opts) as? [CGDisplayMode],
               let hidpi = modes.first(where: {
@@ -179,9 +189,31 @@ final class VirtualDisplay {
         CGBeginDisplayConfiguration(&config)
         CGConfigureDisplayWithDisplayMode(config, display.displayID, hidpi, nil)
         let err = CGCompleteDisplayConfiguration(config, .permanently)
-        Log.info("HiDPI mode (re)selected: \(hidpi.width)x\(hidpi.height)@2x (result \(err.rawValue))")
-        return err == .success
+        if err == .success {
+            hidpiRefusals = 0
+            Log.info("HiDPI mode (re)selected: \(hidpi.width)x\(hidpi.height)@2x (result 0)")
+            return true
+        }
+        hidpiRefusals += 1
+        if hidpiRefusals < Self.hidpiRefusalsBeforeBackoff {
+            Log.info("HiDPI mode (re)selected: \(hidpi.width)x\(hidpi.height)@2x (result \(err.rawValue))")
+            return false
+        }
+        if hidpiRefusals == Self.hidpiRefusalsBeforeBackoff {
+            Log.info("macOS refused the @2x mode \(hidpi.width)x\(hidpi.height) "
+                + "\(hidpiRefusals) times (result \(err.rawValue)) — leaving display "
+                + "\(display.displayID) at 1x, probing again every \(Int(Self.hidpiRetryInterval))s")
+        }
+        hidpiRetryAfter = Date().addingTimeInterval(Self.hidpiRetryInterval)
+        return true
     }
+
+    /// Consecutive `CGCompleteDisplayConfiguration` failures for the @2x mode.
+    private var hidpiRefusals = 0
+    /// While in the future, `selectHiDPIMode` does nothing and reports settled.
+    private var hidpiRetryAfter = Date.distantPast
+    private static let hidpiRefusalsBeforeBackoff = 5
+    private static let hidpiRetryInterval: TimeInterval = 30
 
     /// Arrangement restore + observation (#116). For the first few seconds,
     /// assert `restoreTarget`: macOS restores ITS saved arrangement for this
