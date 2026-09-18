@@ -270,6 +270,9 @@ display ([#72](https://github.com/peetzweg/opendisplay/issues/72)).
 brew install xcodegen   # project generation
 ```
 
+Maintainers preparing a release should use the compatibility and publishing
+checks in [RELEASING.md](RELEASING.md).
+
 Xcode 15+ and a free or paid Apple developer account (to sideload the iOS
 app onto your device).
 
