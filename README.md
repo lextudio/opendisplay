@@ -179,7 +179,7 @@ The capture/streaming pipeline itself uses only public APIs.
 
 ## Compatible apps
 
-The official apps cover a Mac sender and an iPhone/iPad receiver on iOS 16.4+.
+The official apps cover a Mac sender and an iPhone/iPad receiver on iOS 15+.
 Other people have built their own clients that speak the same protocol, so
 you can also use an Android device or an older iPad as a display, or drive
 one from Linux. The wire protocol is specified in
@@ -252,10 +252,13 @@ the same way; both apps update themselves via Sparkle.
 
 ### iPhone app
 
-Needs **iOS / iPadOS 16 or newer** — including the 16.7.x line, which is where
-Apple left the iPad 5 (2017), the iPad Pro 1st gen, the iPhone 8 and the
-iPhone X. If your iPad can't be updated past 16.7, it can still be a second
-display ([#72](https://github.com/peetzweg/opendisplay/issues/72)).
+Needs **iOS / iPadOS 15 or newer**. That reaches the 16.7.x line (iPad 5,
+iPad Pro 1st gen, iPhone 8, iPhone X) and the 15.8.x line, where Apple left
+the iPad Air 2, the iPad mini 4, the iPhone 6s, 7 and the first SE. If your
+iPad can't be updated past 15.8, it can still be a second display
+([#72](https://github.com/peetzweg/opendisplay/issues/72)). Apple Pencil
+hover needs iPadOS 16.4 and an M2 iPad Pro or newer; everything else works
+the same on every supported version.
 
 - **TestFlight** (recommended): join the public beta at
   [testflight.apple.com/join/3NYaY11c](https://testflight.apple.com/join/3NYaY11c).

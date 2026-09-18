@@ -18,6 +18,7 @@ struct DiagnosticsLogView: View {
     @AppStorage("deviceName") private var deviceName = UIDevice.current.name
     @State private var snapshot: Snapshot = .loading
     @State private var copied = false
+    @State private var sharing = false
 
     private enum Snapshot {
         case loading
@@ -34,12 +35,18 @@ struct DiagnosticsLogView: View {
         content
             .navigationTitle("Connection log")
             .navigationBarTitleDisplayMode(.inline)
+            // One group, not conditional items: an `if` without `else`
+            // between ToolbarItems is an Optional<ToolbarContent>, whose
+            // conformance only exists on iOS 16. Inside the group it is an
+            // ordinary optional View, which iOS 15 handles.
             .toolbar {
-                if case let .ready(url, text, _) = snapshot {
-                    ToolbarItem(placement: .primaryAction) {
-                        ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
-                    }
-                    ToolbarItem(placement: .primaryAction) {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    if case let .ready(url, text, _) = snapshot {
+                        if #available(iOS 16, *) {
+                            ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
+                        } else {
+                            Button { sharing = true } label: { Image(systemName: "square.and.arrow.up") }
+                        }
                         Button {
                             UIPasteboard.general.string = text
                             copied = true
@@ -49,6 +56,9 @@ struct DiagnosticsLogView: View {
                         .disabled(copied)
                     }
                 }
+            }
+            .sheet(isPresented: $sharing) {
+                if case let .ready(url, _, _) = snapshot { ShareSheet(items: [url]) }
             }
             .onAppear { load() }
             .task(id: copied) {
@@ -133,4 +143,13 @@ struct DiagnosticsLogView: View {
             return String(cString: base.assumingMemoryBound(to: CChar.self))
         }
     }
+}
+
+/// `ShareLink` is iOS 16; on iOS 15 the same share sheet comes from UIKit.
+private struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

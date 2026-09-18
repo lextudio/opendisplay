@@ -226,6 +226,10 @@ final class StreamReceiver: ObservableObject {
     // nothing about. nil = advertise nothing (sender streams full size).
     private let maxEncodeWide: Int?
     private let maxEncodeHigh: Int?
+    /// Decoder throughput ceiling advertised in `hello.videoCaps`
+    /// (PROTOCOL.md 6.5). The sender keeps the raster and lowers the frame
+    /// rate to stay under it. nil = advertise none.
+    private var maxPixelsPerSecond: Int?
     /// What to advertise when the user-set service name is empty.
     private let fallbackServiceName: String
 
@@ -292,6 +296,15 @@ final class StreamReceiver: ObservableObject {
         devicePixelsWide = w
         devicePixelsHigh = h
         Log.info("panel changed -> \(w)x\(h) @\(scale)x")
+        if let connection { sendHello(on: connection) }
+    }
+
+    /// Hardware decode budget in encoded pixels per second, for silicon that
+    /// cannot sustain its own panel at 60 fps. Re-sends hello if connected.
+    func setDecodeBudget(maxPixelsPerSecond pixelsPerSecond: Int?) {
+        let value = pixelsPerSecond.map { max(4, $0) }
+        guard value != maxPixelsPerSecond else { return }
+        maxPixelsPerSecond = value
         if let connection { sendHello(on: connection) }
     }
 
@@ -883,6 +896,7 @@ final class StreamReceiver: ObservableObject {
             h264["maxWidth"] = maxEncodeWide
             h264["maxHeight"] = maxEncodeHigh
         }
+        if let maxPixelsPerSecond { h264["maxPixelsPerSecond"] = maxPixelsPerSecond }
         hello["videoCaps"] = [h264]
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.

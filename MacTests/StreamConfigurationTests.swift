@@ -73,6 +73,20 @@ final class StreamConfigurationTests: XCTestCase {
         XCTAssertEqual(config.encodedSize, PixelSize(width: 2000, height: 1500))
     }
 
+    func testA8DecodeBudgetKeepsPanelRasterAndLowersRate() throws {
+        // iPad Air 2 / mini 4 announce H.264 Level 4.2 throughput
+        // (iOS/DecodeBudget.swift) for their 2048×1536 panel. The sender must
+        // keep the panel sharp and pay in frame rate, not the other way round.
+        let caps = [VideoCapability(codec: "h264", maxFrameRate: 60,
+                                    maxPixelsPerSecond: 522_240 * 256)]
+        let config = try H264StreamConfiguration.make(
+            source: PixelSize(width: 2048, height: 1536), quality: .best,
+            receiverCapabilities: caps, displayMaxFrameRate: 60)
+
+        XCTAssertEqual(config.encodedSize, PixelSize(width: 2048, height: 1536))
+        XCTAssertEqual(config.framesPerSecond, 42)
+    }
+
     func testPixelThroughputReducesRasterWhenOneFrameWouldExceedIt() throws {
         let maximum = 1_000_000
         let config = try H264StreamConfiguration.make(
