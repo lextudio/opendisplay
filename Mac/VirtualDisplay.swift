@@ -127,6 +127,9 @@ final class VirtualDisplay {
         settings = newSettings
         self.pointsWide = pointsWide
         self.pointsHigh = pointsHigh
+        // A new mode gets a fresh chance: refusals belonged to the old size.
+        hidpiRefusals = 0
+        hidpiRetryAfter = .distantPast
 
         if let origin {
             var config: CGDisplayConfigRef?
@@ -176,13 +179,26 @@ final class VirtualDisplay {
                   $0.width == pointsWide && $0.pixelWidth == pointsWide * 2
               }) else {
             if recover {
-                Log.info("@2x mode vanished from display \(display.displayID) — re-applying settings")
+                // Same back-off as a refusal: a mode list that stays without
+                // our @2x entry would otherwise be re-applied and logged every
+                // 2s for as long as the display lives.
+                hidpiRefusals += 1
+                if hidpiRefusals <= Self.hidpiRefusalsBeforeBackoff {
+                    Log.info("@2x mode vanished from display \(display.displayID) — re-applying settings"
+                        + (hidpiRefusals == Self.hidpiRefusalsBeforeBackoff
+                           ? " (probing again every \(Int(Self.hidpiRetryInterval))s from now)" : ""))
+                }
                 _ = display.apply(settings)
+                if hidpiRefusals >= Self.hidpiRefusalsBeforeBackoff {
+                    hidpiRetryAfter = Date().addingTimeInterval(Self.hidpiRetryInterval)
+                    return true
+                }
             }
             return false
         }
         if let current = CGDisplayCopyDisplayMode(display.displayID),
            current.width == hidpi.width, current.pixelWidth == hidpi.pixelWidth {
+            hidpiRefusals = 0   // WindowServer may have restored it for us
             return true
         }
         var config: CGDisplayConfigRef?
