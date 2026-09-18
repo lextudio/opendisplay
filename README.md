@@ -257,8 +257,9 @@ iPad Pro 1st gen, iPhone 8, iPhone X) and the 15.8.x line, where Apple left
 the iPad Air 2, the iPad mini 4, the iPhone 6s, 7 and the first SE. If your
 iPad can't be updated past 15.8, it can still be a second display
 ([#72](https://github.com/peetzweg/opendisplay/issues/72)). Apple Pencil
-hover needs iPadOS 16.4 and an M2 iPad Pro or newer; everything else works
-the same on every supported version.
+hover needs iPadOS 16.4 and a hover-capable iPad and Pencil pairing (see
+[Apple's list](https://support.apple.com/guide/ipad/ipadc55b6c7a/ipados));
+everything else works the same on every supported version.
 
 - **TestFlight** (recommended): join the public beta at
   [testflight.apple.com/join/3NYaY11c](https://testflight.apple.com/join/3NYaY11c).

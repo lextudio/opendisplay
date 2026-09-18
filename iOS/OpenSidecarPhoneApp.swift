@@ -246,7 +246,7 @@ struct OnboardingView: View {
     let onClose: () -> Void
 
     var body: some View {
-        NavigationView {
+        AdaptiveNavigation {
             ScrollView {
                 VStack(spacing: 28) {
                     Image(systemName: "laptopcomputer.and.iphone")
@@ -302,7 +302,6 @@ struct OnboardingView: View {
                 }
             }
         }
-        .navigationViewStyle(.stack)
     }
 }
 
@@ -319,7 +318,7 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        NavigationView {
+        AdaptiveNavigation {
             Form {
                 Section("Status") {
                     LabeledRow("Listening", value: "Port 9000")
@@ -416,22 +415,42 @@ struct SettingsView: View {
                 }
             }
         }
-        .navigationViewStyle(.stack)
     }
 }
 
-/// `LabeledContent` is iOS 16; this is the same row on the iOS 15 floor.
+/// `NavigationStack` where it exists (iOS 16), a single-column
+/// `NavigationView` on the iOS 15 floor. Both sheets here are one level deep,
+/// so the two behave the same; this keeps the modern API where it is available.
+struct AdaptiveNavigation<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+    var body: some View {
+        if #available(iOS 16, *) {
+            NavigationStack { content() }
+        } else {
+            NavigationView { content() }
+                .navigationViewStyle(.stack)
+        }
+    }
+}
+
+/// `LabeledContent` where it exists (iOS 16, with its VoiceOver pairing of
+/// label and value); the equivalent HStack on the iOS 15 floor.
 struct LabeledRow: View {
     let title: String
     let value: String
     init(_ title: String, value: String) { self.title = title; self.value = value }
     var body: some View {
-        HStack {
-            Text(title)
-            Spacer()
-            Text(value)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.trailing)
+        if #available(iOS 16, *) {
+            LabeledContent(title, value: value)
+        } else {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(value)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
+            }
+            .accessibilityElement(children: .combine)
         }
     }
 }
