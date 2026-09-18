@@ -254,6 +254,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let cursorNetworkLock = NSLock()
     private var cursorConnection: NWConnection?
     private var cursorChannelPort: NWEndpoint.Port?
+    // Connection generation that negotiated `cursorConnection`. Protected by
+    // `cursorNetworkLock` with the socket so an old cursorQueue sample cannot
+    // resume after reconnect and adopt the new session's UDP flow.
+    private var cursorConnectionGeneration: UInt64 = 0
     // True once the receiver acked a datagram (cursorAck). Until then every
     // position also rides TCP: UDP .ready proves only a local route, and a
     // silently firewalled port must not eat the cursor. Duplicates are
@@ -262,6 +266,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var cursorChannelConfirmed = false
     private var cursorConnectionReady = false
     private var cursorSeq: UInt64 = 0
+    // The TCP fallback crosses from `cursorQueue` to the sender `queue`.
+    // Carry the session that owned the sample so a position queued just before
+    // reconnect cannot adopt the fresh socket with its old, high sequence.
+    // Only touched on `cursorQueue`.
+    private var cursorSessionGeneration: UInt64 = 0
     private var captureDisplayID: CGDirectDisplayID = 0
     // ScreenCaptureKit and VideoToolbox finish work asynchronously. During a
     // rotation, an old capture callback or a late encoder completion must not
@@ -1188,12 +1197,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func becomeReady(_ conn: NWConnection) {
         Log.info("connection ready to \(endpointName)")
         connectionGeneration &+= 1
+        let readyGeneration = connectionGeneration
         // Per-session; the receiver rewound its floor with the connection.
         // Keep both cursor-side resets on the cursor queue so reconnects do
-        // not race the 120 Hz sampler.
+        // not race the 120 Hz sampler. Publishing the matching generation in
+        // the same block lets queued samples from the retired session be
+        // rejected when they eventually reach the sender queue.
         cursorQueue.async {
             self.cursorSeq = 0
             self.lastCursorSent = (-1, -1, false)
+            self.cursorSessionGeneration = readyGeneration
         }
         everConnected = true
         awaitingWake = false
@@ -1737,20 +1750,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// blocks: a send on a dead UDP socket just fails in its completion.
     private func sendCursor(_ fields: String) {
         cursorSeq &+= 1
+        let sessionGeneration = cursorSessionGeneration
         let message = "{\"type\":\"cursor\",\(fields),\"s\":\(cursorSeq)}"
         cursorNetworkLock.lock()
         let udp = cursorConnection
         let udpReady = cursorConnectionReady
         let udpConfirmed = cursorChannelConfirmed
+        let udpGeneration = cursorConnectionGeneration
         cursorNetworkLock.unlock()
-        if let udp, udpReady {
+        if let udp, udpReady, udpGeneration == sessionGeneration {
             udp.send(content: Data(message.utf8), completion: .contentProcessed { _ in })
             if udpConfirmed { return }
         }
         // Before the UDP ack (and whenever UDP is unavailable), retain the
         // established TCP fallback. Its queue may be busy with video, but a
         // confirmed side channel never takes this path.
-        queue.async { [weak self] in self?.sendJSONFrame(message) }
+        queue.async { [weak self] in
+            guard let self, self.connectionGeneration == sessionGeneration else { return }
+            self.sendJSONFrame(message)
+        }
     }
 
     /// Dial the receiver's UDP cursor port (must be called on `queue`). WiFi
@@ -1787,6 +1805,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorNetworkLock.lock()
         cursorConnection = udp
         cursorChannelPort = udpPort
+        cursorConnectionGeneration = connectionGeneration
         cursorNetworkLock.unlock()
         // cursorSeq is session-scoped (reset in becomeReady), not per flow:
         // TCP frames carry the same sequence, and a flow-local restart would
@@ -1851,6 +1870,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorConnectionReady = false
         cursorConnection = nil
         cursorChannelPort = nil
+        cursorConnectionGeneration = 0
         cursorNetworkLock.unlock()
         oldConnection?.cancel()
     }

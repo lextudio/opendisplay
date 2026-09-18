@@ -579,7 +579,11 @@ final class StreamReceiver: ObservableObject {
                 self.pendingConnections.append(conn)
                 conn.stateUpdateHandler = { [weak self] state in
                     guard let self, case .ready = state else { return }
-                    self.sendHello(on: conn)
+                    // This socket has not won the session yet. Keep cursor UDP
+                    // out of its provisional hello: otherwise its flow could
+                    // arrive before adopt(), then be indistinguishable from
+                    // the old session's flow that adopt must retire.
+                    self.sendHello(on: conn, includeCursorPort: false)
                     conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
                         [weak self] data, _, isComplete, error in
                         guard let self else { return }
@@ -628,9 +632,10 @@ final class StreamReceiver: ObservableObject {
     }
 
     /// Make `conn` the session: replace any existing connection and reset
-    /// decoder state. `greeted` marks a newcomer that already got its hello
-    /// while it proved itself (see the listener), with the bytes it sent
-    /// back in `initialData`; a second hello would make the sender rebuild.
+    /// decoder state. `greeted` marks a newcomer that got a provisional hello
+    /// without the cursor port while it proved itself (see the listener), with
+    /// the bytes it sent back in `initialData`. Once adopted, the full hello
+    /// opens a cursor flow that unambiguously belongs to this session.
     private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
         connection?.cancel()
@@ -638,6 +643,13 @@ final class StreamReceiver: ObservableObject {
         // The race is decided: rival candidates die here.
         for pending in pendingConnections where pending !== conn { pending.cancel() }
         pendingConnections.removeAll()
+        // UDP cursor flows are scoped to the TCP session that negotiated
+        // them. Retire the old flow before rewinding the sequence floor so an
+        // in-flight datagram from the previous sender cannot establish a high
+        // floor on this fresh session. The listener remains up for the new
+        // sender to open its own flow after hello.
+        cursorConnection?.cancel()
+        cursorConnection = nil
         resetStreamState()
         lastCursorSeq = 0   // the sender restarts its cursor sequence per session
         cursorPortAnnounced = false
@@ -653,7 +665,7 @@ final class StreamReceiver: ObservableObject {
             guard let self else { return }
             self.lastDataReceived = Date()
             self.setConnected(true)
-            if !greeted { self.sendHello(on: conn) }
+            self.sendHello(on: conn)
         }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self, conn === self.connection else { return }   // replaced: stay quiet
@@ -853,7 +865,7 @@ final class StreamReceiver: ObservableObject {
 
     // MARK: - Control messages (phone -> Mac)
 
-    private func sendHello(on conn: NWConnection) {
+    private func sendHello(on conn: NWConnection, includeCursorPort: Bool = true) {
         var hello: [String: Any] = [
             "type": "hello",
             "pixelsWide": devicePixelsWide,
@@ -874,7 +886,8 @@ final class StreamReceiver: ObservableObject {
         hello["videoCaps"] = [h264]
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
-        if cursorListenerReady { hello["cursorPort"] = Int(cursorPort) }
+        let announcesCursorPort = includeCursorPort && cursorListenerReady
+        if announcesCursorPort { hello["cursorPort"] = Int(cursorPort) }
         // Additive: decode ceiling (PROTOCOL.md 6.5) — ask for the full
         // desktop but a stream no larger than this machine can decode.
         if let maxEncodeWide, let maxEncodeHigh {
@@ -893,9 +906,11 @@ final class StreamReceiver: ObservableObject {
         let addrs = advertisesAddresses ? Self.reachableAddresses() : []
         if !addrs.isEmpty { hello["addrs"] = addrs }
         lastAdvertisedAddrs = addrs
-        cursorPortAnnounced = cursorListenerReady
+        // A provisional hello goes to a candidate while the old connection is
+        // still active; it must not change bookkeeping for that live session.
+        if connection === conn { cursorPortAnnounced = announcesCursorPort }
         sendControl(hello, on: conn)
-        Log.info("hello sent\(cursorListenerReady ? " (cursorPort \(cursorPort))" : "")")
+        Log.info("hello sent\(announcesCursorPort ? " (cursorPort \(cursorPort))" : "")")
     }
 
     /// Every IP address of an up, non-loopback interface, for hello.addrs.
