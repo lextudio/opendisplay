@@ -128,35 +128,70 @@ Thunderbolt 2 cable.
 Input from the receiving Mac's keyboard and mouse is a follow-up
 ([#147](https://github.com/peetzweg/opendisplay/issues/147)).
 
-**Do the Larger Text / More Space display settings affect Mac receiver performance?**
-Yes, in Extend mode. On a Mac receiver, this setting changes the logical size
-of the desktop, not only the apparent text size. OpenDisplay advertises that
-desktop at Retina scale, and the sender creates, renders, captures, and encodes
-a virtual display with the same working area. **More Space** therefore gives
-you room for more windows, but starts with a larger source surface and puts
-more pressure on rendering, capture, scaling, encoding, and the network. At a
-fixed bitrate it also gives each pixel less data. Moving toward **Larger Text**
-reduces that work and can be noticeably smoother, especially over WiFi.
+**Why does the Default display setting look soft on a 5K Mac receiver?**
+In Extend mode, the receiver's scaled display setting determines the virtual
+desktop size on the sender. The sender renders it at Retina scale, but the
+current H.264 stream is capped at 4096×2304. On the 5K iMac used for testing:
 
-For example, on the 5K iMac used for testing, the less-spacious setting offers
-a 1600×900-point desktop and a 3200×1800 stream at up to 60 fps. More Space
-offers a 3200×1800-point desktop, which is rendered at 6400×3600; the current
-H.264 path safely scales that to 4096×2304 at up to 55 fps. That is about 50%
-more encoded pixels per second, in addition to the four-times-larger source
-surface. Exact sizes vary by Mac.
+| iMac display setting | Sender's rendered desktop | Video sent to receiver |
+| --- | --- | --- |
+| 1600×900 (Larger Text) | 3200×1800 | 3200×1800 |
+| 2048×1152 | 4096×2304 | 4096×2304 |
+| 2560×1440 (Default) | 5120×2880 | 4096×2304 |
+| 2880×1620 or 3200×1800 | 5760×3240 or 6400×3600 | 4096×2304 |
 
-Start with the receiver's **Default** setting. Move one or more steps toward
-**Larger Text** when smoothness and latency matter most, or toward **More
-Space** when desktop area matters and you have a fast wired connection. The
-sender's Best/Balanced/Fast setting can reduce the transmitted image further
-without changing the desktop's working area. Fullscreen changes presentation
-and compositor load, but not the negotiated stream resolution. In Mirror mode,
-the sending Mac's display determines the capture resolution, so the receiver's
-display setting has much less effect.
+Every video size in this table is enlarged to fill the 5K panel. At 2048×1152
+and 1600×900, text is drawn directly into the video raster and enlarged once.
+At **Default** and larger desktop settings, finer text is rendered above the
+stream limit, shrunk for transmission, then enlarged again. Those two scaling
+steps can look softer, even though Default and 2048×1152 both report 4096×2304
+video. The larger text in the smaller desktop modes also survives scaling and
+compression better. The **res** number is the video raster, not the sender's
+rendered desktop size. Display-setting changes are sent during an active
+session; a reconnect is normally unnecessary.
 
-**Why H.264 and not HEVC/AV1?** Hardware H.264 encode/decode is universally
-fast and the latency is excellent. HEVC is a planned option for better
-quality-per-bit.
+For this 5K setup, try **2048×1152** first for a sharper image with useful
+desktop space, or **1600×900** for larger text and less encode work. Keep the
+sender on **Best** quality if text sharpness matters: Balanced and Fast reduce
+the video resolution further. Test visual quality in the receiver's fullscreen
+video window; a smaller window adds another scaling step. Exact sizes and the
+best setting vary by Mac.
+
+The configured stream rate is a ceiling, not a measured frame rate. In one
+M1 Pro sender / 2017 Intel 5K iMac test over a USB-C data cable, Best quality
+at 4096×2304 delivered about 28–34 fps during motion. The network-drop counter
+stayed at zero while the sender dropped frames waiting for its encoder. A
+Thunderbolt cable alone would not raise the frame rate in that setup. Reducing
+the rendered desktop or video resolution can help; a faster cable helps when
+the network is the bottleneck. In Mirror mode, the sending Mac's display
+determines the capture resolution, so the receiver's display setting has much
+less effect.
+
+**Can HEVC make Default sharp or reach 60 fps?** Experimental HEVC in Debug
+builds can send a native 5120×2880 stream when both Macs opt in and support
+hardware HEVC. On the test pair above, the iMac's Default setting then looked
+sharper because the sender no longer shrank the 5K desktop before transmission.
+With a moving test window, however, it delivered about **23 fps** at native 5K.
+At Best quality and the 2048×1152 display setting (4096×2304 video), it
+delivered about **31–34 fps**. Fast quality at that same display setting
+(2048×1152 video) reached **59–60 fps**, with much softer text. The sender
+captured 59–60 fps in these tests; its encoder caused the higher-resolution
+drops, while network drops stayed at zero. HEVC therefore improves Default's
+sharpness on this pair but does not make native 5K smooth. The 2048×1152
+display setting with Best quality remains the practical sharpness/smoothness
+compromise. These are measurements from one pair, not guaranteed rates.
+
+For local Debug testing, enable HEVC on both Macs and restart both Debug apps:
+
+```sh
+# On the sending Mac
+defaults write com.peetzweg.opensidecar.mac.debug hevcExperimental -bool YES
+# On the receiving Mac
+defaults write com.peetzweg.opensidecar.mac.receiver.debug hevcExperimental -bool YES
+```
+
+The [M5 Pro test handoff](HEVC-M5-HANDOFF.md) records the 5K baseline and a
+repeatable sender/receiver setup for comparing a newer Mac.
 
 **Is my screen content sent anywhere?** No. One direct TCP connection
 between your Mac and your device, over your cable or your LAN. No servers,
