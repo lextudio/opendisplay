@@ -4,6 +4,7 @@ members = [
     "crates/opendisplay-proto",
     "crates/opendisplay-session",
     "crates/od-fake-sender",
+    "crates/od-receiver",
 ]
 
 [workspace.package]
@@ -26,6 +27,10 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
+mdns-sd = "0.21"
+wayland-client = "0.31"
+gstreamer = "0.25"
+gstreamer-app = "0.25"
 
 [profile.release]
 lto = "thin"

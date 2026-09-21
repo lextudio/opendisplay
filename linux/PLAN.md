@@ -300,6 +300,13 @@ port 5353 ever misbehaves.
    `hello`/`ping`/`kf`/`welcome`, latest-wins present, `stats`. Validated
    against the **real Mac sender** through a UTM port forward (§1). First real
    picture.
+   *Status 2026-09-21: `od-receiver` implemented on `linux-plan` — TCP with
+   adopt-and-drop, optional UDP cursor port, `mdns-sd` advertisement, panel
+   facts from `wl_output` v4, `stats` every 5 s, GStreamer
+   `appsrc ! h264parse ! decodebin3 ! queue(leaky,1) ! waylandsink` behind a
+   `VideoOutput` trait with a `--sink none` protocol-only mode. Verified live on
+   the dev VM against `od-fake-sender` (sink none). **Not yet verified:** decode
+   and present (needs `gst-libav`/`pkgconf` on the VM) and the real Mac sender.*
 3. **Sender v1 (Hyprland).** Headless output sized from `hello`, capture,
    encode (per Spike 0), IDR on connect/`kf`, `welcome`, `pong`, cursor over
    TCP via the ext cursor session, `touch`→pointer and `scroll` injection.
