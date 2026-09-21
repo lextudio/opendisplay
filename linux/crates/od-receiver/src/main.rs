@@ -35,8 +35,9 @@ struct Args {
     /// Override `hello.displayMaxFrameRate` (else the output's refresh).
     #[arg(long)]
     refresh: Option<u32>,
-    /// wayland | auto | fake | none
-    #[arg(long, default_value = "wayland")]
+    /// gl | wayland | auto | fake | none. `wayland` supports --output fullscreen
+    /// placement but crashes on output hotplug with GStreamer <= 1.28.7.
+    #[arg(long, default_value = "gl")]
     sink: SinkKind,
     /// GStreamer decoder element (decodebin3 autoplugs by rank).
     #[arg(long, default_value = "decodebin3")]

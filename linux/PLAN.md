@@ -437,7 +437,49 @@ port 5353 ever misbehaves.
   precondition (reference spec + versioning) shipped and the Linux
   implementation is tracked in #284 + the sender issue.
 
-### 6.4 Doc updates in this repo
+### 6.4 Upstream bug: GStreamer `waylandsink` crashes on output hotplug
+
+File at <https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues> (component
+gst-plugins-bad / wayland). Reproduced on Hyprland 0.56.1, GStreamer 1.28.7:
+
+```sh
+gst-launch-1.0 videotestsrc ! waylandsink &
+hyprctl output create headless x      # -> gst-launch: Caught SIGSEGV
+```
+
+Backtrace (thread `GstWlDisplay`): `wl_display_dispatch_queue_pending` →
+`libgstwayland output_done` → `g_mutex_lock` (SEGV_MAPERR). Cause, in
+`gst-libs/gst/wayland/gstwldisplay.c`:
+
+```c
+static void
+output_done (void *data, struct wl_output *wl_output)
+{
+  GstWlOutput *output = GST_WL_OUTPUT (data);
+  GstWlDisplay *self = g_object_steal_data (G_OBJECT (output), "display");
+  GstWlDisplayPrivate *priv = gst_wl_display_get_instance_private (self);
+  ...
+  g_mutex_lock (&priv->outputs_mutex);
+```
+
+`wl_output.done` is emitted after *every* batch of output property changes,
+not once per output. Adding an output makes the compositor re-send geometry
+(+ `done`) for the existing ones; the second `done` finds the stolen data gone,
+`self` is NULL, `priv` is garbage, `g_mutex_lock` faults. Proposed fix:
+
+```diff
+-  GstWlDisplay *self = g_object_steal_data (G_OBJECT (output), "display");
++  GstWlDisplay *self = g_object_get_data (G_OBJECT (output), "display");
+```
+
+(and drop the `g_object_set_data` ref only when the output is removed in
+`registry_handle_global_remove`). Impact for us: the receiver died whenever
+the sender created its virtual display on the same compositor, and it would
+die on any laptop that docks a monitor mid-session. Until fixed, `od-receiver`
+defaults to `--sink gl` (`glimagesink`, survives hotplug); `--sink wayland`
+stays available for `fullscreen-output` placement.
+
+### 6.5 Doc updates in this repo
 
 * `PROTOCOL.md` Appendix B: the "headless Wayland output" hint can cite the
   concrete Hyprland mechanism and `ext-image-copy-capture` cursor sessions as

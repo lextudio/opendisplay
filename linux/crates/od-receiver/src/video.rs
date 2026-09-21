@@ -8,7 +8,15 @@ use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkKind {
-    /// `waylandsink`, fullscreen on a chosen output. The production path.
+    /// `glimagesink`: its own xdg toplevel via GStreamer GL; survives output
+    /// hotplug. Default until the waylandsink bug below is fixed upstream.
+    /// Fullscreen/output placement comes from a compositor window rule.
+    Gl,
+    /// `waylandsink`, fullscreen on a chosen output (`fullscreen-output`).
+    /// GStreamer <= 1.28.7 crashes in `gstwldisplay.c:output_done` when the
+    /// compositor re-sends `wl_output.done` (any output hotplug/move): it
+    /// `g_object_steal_data`s the display pointer on the first `done`, so
+    /// the second dereferences NULL. Opt-in until that is fixed.
     Wayland,
     /// `autovideosink`: whatever the machine has (debugging).
     Auto,
@@ -22,11 +30,16 @@ impl std::str::FromStr for SinkKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
         Ok(match s {
+            "gl" => SinkKind::Gl,
             "wayland" => SinkKind::Wayland,
             "auto" => SinkKind::Auto,
             "fake" => SinkKind::Fake,
             "none" => SinkKind::None,
-            other => return Err(format!("unknown sink `{other}` (wayland|auto|fake|none)")),
+            other => {
+                return Err(format!(
+                    "unknown sink `{other}` (gl|wayland|auto|fake|none)"
+                ));
+            }
         })
     }
 }
@@ -124,6 +137,7 @@ pub mod gst_out {
                 }
                 s
             }
+            SinkKind::Gl => "glimagesink sync=false".into(),
             SinkKind::Auto => "autovideosink sync=false".into(),
             SinkKind::Fake => "fakesink sync=false".into(),
             SinkKind::None => unreachable!(),
@@ -175,6 +189,11 @@ pub mod gst_out {
                 return Err(anyhow!(
                     "no H.264 decoder element installed; install gst-libav (avdec_h264) or gst-plugin-va (vah264dec)"
                 ));
+            }
+            if cfg.sink == SinkKind::Wayland {
+                warn!(
+                    "waylandsink <= 1.28.7 crashes on output hotplug (gstwldisplay.c output_done); --sink gl is the safe default"
+                );
             }
             let desc = launch_description(cfg);
             let pipeline = gst::parse::launch(&desc)
