@@ -279,7 +279,18 @@ port 5353 ever misbehaves.
 
 ## 4. Milestones
 
-0. **Spike 0 (iMac, when available; ~2 days).** Rust program that: creates a
+0. **Spike 0 (iMac, when available; ~2 days).**
+   *Partial status 2026-09-21 (dev VM, software path):* `od-sender` has the
+   Hyprland IPC backend (`monitors`, create/configure/remove headless outputs —
+   2732×2048@120 scale 2 came up in 58 ms) and an `ext-image-copy-capture-v1`
+   shm capture loop (`od-sender capture-test`). Findings: Hyprland offers
+   `Argb8888`/`Xrgb8888` shm; capture is **damage-driven** — a static output
+   yields no frames, so the sender must keep the last encoded IDR to replay on
+   connect/`kf` (§5.3) and must not treat silence as a stall; first frame after
+   26–61 ms; frame interval p50 ≈ 17 ms while an output is animating. Remaining
+   for the real Spike 0: dmabuf buffers, VA-API encode, cursor session, and
+   `zwlr_output_manager_v1.set_custom_mode` — all need the iMac.
+   **Spike 0 proper:** Rust program that: creates a
    headless output over Hyprland IPC, captures dmabufs via
    ext-image-copy-capture at the output rate with a cursor session, feeds them
    to (a) `h264_vaapi` via `ffmpeg-next` and (b) `vah264enc` via GStreamer,
