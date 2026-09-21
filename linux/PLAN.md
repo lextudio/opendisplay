@@ -291,6 +291,10 @@ port 5353 ever misbehaves.
    video-frame-starting-with-`{` case, telemetry-prefix stripping, unknown
    type/field tolerance, clock-offset math, adopt-and-drop. Green on both CI
    arches. Can be done entirely on the dev VM.
+   *Status 2026-09-21: done on branch `linux-plan` — 47 tests incl. a
+   sender/receiver loopback suite and a TCP end-to-end run of the fake sender;
+   `.github/workflows/linux.yml` runs it on both arches. Adopt-and-drop is
+   host-level and lands with the receiver binary in M2.*
 2. **Receiver v1 (dev VM, then Omarchy laptops).** Fullscreen `waylandsink`,
    software decode via `gst-libav`, hardware where `gst-plugin-va` is present,
    `hello`/`ping`/`kf`/`welcome`, latest-wins present, `stats`. Validated
