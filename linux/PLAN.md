@@ -329,8 +329,11 @@ port 5353 ever misbehaves.
    (cursor baked in for now), encodes with **OpenH264** (bundled, no system
    deps), sends `streamConfig`, IDR on connect/`kf` with static-screen replay,
    removes the output on disconnect, redials. Verified against `od-receiver
-   --sink none`. **Not done:** input injection, cursor session/`cursor` messages,
-   hardware encode, iOS receiver test (needs network).*
+   --sink none`. `touch`→`zwlr_virtual_pointer_v1` absolute motion + left button and
+   `scroll`→axis events bound to the virtual output are in and verified via
+   `od-sender input-test` (IPC `cursorpos` matches to the pixel). **Not done:**
+   cursor session/`cursor` messages, hardware encode, iOS receiver test (needs
+   network).*
    *Software encoder reality (release build, 8 ARM vCPUs, incl. BGRA→I420):
    OpenH264 1280×800 ≈ 10 ms/frame, 1080p ≈ 21 ms, 2560×1600 ≈ 43 ms, 2732×2048
    ≈ 62 ms. That is 3–8× slower than x264 `ultrafast` (§2.4), so OpenH264 is

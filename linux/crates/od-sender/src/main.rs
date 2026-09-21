@@ -2,6 +2,7 @@ mod capture;
 mod discover;
 mod encoder;
 mod hyprland;
+mod input;
 mod run;
 
 use std::time::{Duration, Instant};
@@ -80,6 +81,14 @@ enum Cmd {
         threads: u16,
         #[arg(long, default_value_t = 20.0)]
         bitrate_mbps: f32,
+    },
+    /// Create a headless output, move the pointer onto it via the virtual
+    /// pointer protocol and verify the position through Hyprland IPC.
+    InputTest {
+        #[arg(long, default_value_t = 0.25)]
+        x: f64,
+        #[arg(long, default_value_t = 0.75)]
+        y: f64,
     },
     /// Capture an output via ext-image-copy-capture into shm and report frame timing.
     CaptureTest {
@@ -204,6 +213,30 @@ async fn main() -> Result<()> {
                 times[n - 1],
                 1000.0 / times[n / 2],
                 bytes as f64 / n as f64 / 1024.0
+            );
+        }
+        Cmd::InputTest { x, y } => {
+            let ipc = hyprland::HyprlandIpc::from_env()?;
+            let name = "od-input-test";
+            let before = ipc.request("cursorpos")?.trim().to_string();
+            ipc.create_headless(name)?;
+            let m = ipc.configure(name, 1600, 1000, 60, 2.0, "auto-right")?;
+            let injector = input::InputInjector::start(name, m.scale)?;
+            injector.send(input::InputCmd::Move { x, y });
+            std::thread::sleep(Duration::from_millis(150));
+            let after = ipc.request("cursorpos")?.trim().to_string();
+            // Expected in Hyprland's layout coordinates: monitor origin + normalised * logical size.
+            let (lw, lh) = (m.width as f64 / m.scale, m.height as f64 / m.scale);
+            let expect = (m.x as f64 + x * lw, m.y as f64 + y * lh);
+            info!(
+                "cursorpos before: {before}; after move to ({x},{y}) on {name}: {after}; expected ~({:.0}, {:.0})",
+                expect.0, expect.1
+            );
+            drop(injector);
+            ipc.remove_output(name)?;
+            info!(
+                "removed {name}; cursorpos now: {}",
+                ipc.request("cursorpos")?.trim()
             );
         }
         Cmd::Monitors => {

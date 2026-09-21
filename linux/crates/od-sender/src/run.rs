@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use crate::capture::{self, FrameInfo};
 use crate::encoder::{Encoded, Encoder, EncoderSettings};
 use crate::hyprland::HyprlandIpc;
+use crate::input::{InputCmd, InputInjector};
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -47,6 +48,7 @@ struct Display {
     force_idr: Arc<AtomicBool>,
     encoded_rx: mpsc::Receiver<Encoded>,
     hello: Hello,
+    input: Option<InputInjector>,
 }
 
 fn now(start: Instant) -> Now {
@@ -210,12 +212,20 @@ impl Display {
                 debug!("encoder thread done");
             })?;
 
+        let input = match InputInjector::start(&name, scale) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                warn!("input injection unavailable: {e:#}");
+                None
+            }
+        };
         Ok(Display {
             name,
             stop,
             force_idr,
             encoded_rx,
             hello: hello.clone(),
+            input,
         })
     }
 
@@ -342,8 +352,18 @@ async fn session(
                             d.force_idr.store(true, Ordering::Relaxed);
                         }
                     }
-                    SenderAction::Touch(t) => debug!("touch {:?} {:.3},{:.3}", t.phase, t.x, t.y),
-                    SenderAction::Scroll(s) => debug!("scroll {} {}", s.dx, s.dy),
+                    SenderAction::Touch(t) => {
+                        debug!("touch {:?} {:.3},{:.3}", t.phase, t.x, t.y);
+                        if let Some(i) = display.as_ref().and_then(|d| d.input.as_ref()) {
+                            i.send(InputCmd::Touch(t));
+                        }
+                    }
+                    SenderAction::Scroll(s) => {
+                        debug!("scroll {} {}", s.dx, s.dy);
+                        if let Some(i) = display.as_ref().and_then(|d| d.input.as_ref()) {
+                            i.send(InputCmd::Scroll(s));
+                        }
+                    }
                     SenderAction::Pencil(_) | SenderAction::Proximity(_) => {}
                     SenderAction::Stats(v) => info!("PHONE-STATS {v}"),
                     SenderAction::ReceiverSleeping => info!("receiver sleeping"),
