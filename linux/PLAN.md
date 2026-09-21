@@ -322,6 +322,20 @@ port 5353 ever misbehaves.
    encode (per Spike 0), IDR on connect/`kf`, `welcome`, `pong`, cursor over
    TCP via the ext cursor session, `touch`→pointer and `scroll` injection.
    Validated against the **real iOS receiver**.
+   *Status 2026-09-21: software path running on the dev VM — `od-sender run
+   [--connect addr | --name X]` dials or discovers a receiver, creates
+   `od-<id>` from `hello` (mode = panel pixels @ displayMaxFrameRate, scale =
+   hello.scale, position configurable), captures it via ext-image-copy-capture
+   (cursor baked in for now), encodes with **OpenH264** (bundled, no system
+   deps), sends `streamConfig`, IDR on connect/`kf` with static-screen replay,
+   removes the output on disconnect, redials. Verified against `od-receiver
+   --sink none`. **Not done:** input injection, cursor session/`cursor` messages,
+   hardware encode, iOS receiver test (needs network).*
+   *Software encoder reality (release build, 8 ARM vCPUs, incl. BGRA→I420):
+   OpenH264 1280×800 ≈ 10 ms/frame, 1080p ≈ 21 ms, 2560×1600 ≈ 43 ms, 2732×2048
+   ≈ 62 ms. That is 3–8× slower than x264 `ultrafast` (§2.4), so OpenH264 is
+   the zero-dependency floor only; the real software tier should be x264
+   (`x264enc` via GStreamer or libx264 directly) and the real path VA-API.*
 4. **Latency and polish.** UDP cursor side channel + `cursorAck`, `stats`
    with `e2e50/95` from the telemetry prefix + clock offset, `wp_presentation`
    based present timing, `streamConfig`/`videoCaps` intersection, adaptive

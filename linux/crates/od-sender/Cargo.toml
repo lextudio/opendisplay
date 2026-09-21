@@ -20,3 +20,6 @@ serde_json = { workspace = true }
 wayland-client = { workspace = true }
 wayland-protocols = { workspace = true }
 wayland-protocols-wlr = { workspace = true }
+openh264 = { workspace = true }
+mdns-sd = { workspace = true }
+uuid = { workspace = true }
