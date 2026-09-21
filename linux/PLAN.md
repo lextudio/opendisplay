@@ -262,11 +262,16 @@ port 5353 ever misbehaves.
 
 ### 3.9 Packaging and deployment
 
-* **Omarchy/Arch**: `PKGBUILD` (AUR `opendisplay-linux`), depends on
-  `gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav`,
-  optdepends `gst-plugin-va` (x86 hardware), `gst-plugin-pipewire` (portal
-  backend). Receiver runs as a normal fullscreen Hyprland window on a chosen
-  monitor; sender is a tray/CLI app.
+* **Omarchy/Arch**: `linux/packaging/arch/PKGBUILD` builds from a checkout
+  (`makepkg -si`; pacman resolves build and run-time deps). Dependency split:
+  build-time only `pkgconf cargo gcc`; run-time `gst-plugins-good`,
+  `gst-plugins-bad`, `gst-libav` (plugins are dlopen'ed by name, so they must
+  stay real deps), optdepends `gst-plugin-va` (x86 hardware), `libva-utils`,
+  `gst-plugin-pipewire` (portal backend, future). The sender needs nothing
+  beyond libwayland today (OpenH264 is compiled in). At first release: AUR
+  `opendisplay-bin` pulling the CI-built `x86_64`/`aarch64` binaries, so
+  `yay -S opendisplay-bin` is the Omarchy one-liner; ships a `.desktop` entry
+  and a `systemd --user` unit for autostarting the receiver.
 * **NixOS**: `flake.nix` with `packages` for both arches, a `devShell`, and
   `nixosModules.receiver-kiosk` = `services.cage.program = od-receiver` +
   autologin-free boot + power-button shutdown. Same binary as Omarchy.
