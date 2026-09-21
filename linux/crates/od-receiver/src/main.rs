@@ -44,6 +44,10 @@ struct Args {
     /// Present in a normal window instead of fullscreen.
     #[arg(long)]
     windowed: bool,
+    /// Skip the videoconvert before the sink (zero-copy experiments with
+    /// dmabuf-capable decoders and sinks).
+    #[arg(long)]
+    no_videoconvert: bool,
     /// Do not advertise via mDNS.
     #[arg(long)]
     no_mdns: bool,
@@ -113,6 +117,7 @@ async fn main() -> Result<()> {
         decoder: a.decoder.clone(),
         fullscreen: !a.windowed,
         output: output_name,
+        videoconvert: !a.no_videoconvert,
     })?;
 
     let receiver = Receiver::bind(

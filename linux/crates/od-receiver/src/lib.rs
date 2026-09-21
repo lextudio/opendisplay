@@ -47,6 +47,8 @@ pub struct Report {
     pub decode_errors: u32,
     pub cursor_updates: u64,
     pub closes: u32,
+    /// Frames that reached the sink (None when the backend cannot tell).
+    pub rendered_frames: Option<u64>,
 }
 
 pub struct Receiver {
@@ -119,6 +121,7 @@ impl Receiver {
         let mut stats_tick = tokio::time::interval(self.cfg.stats_every);
         stats_tick.reset();
         let mut window = stats::Window::default();
+        let mut last_rendered: u64 = 0;
         info!(
             "listening on {} ({}x{} @{} scale {}, cursor UDP {:?}, video: {})",
             self.listener.local_addr()?,
@@ -183,6 +186,11 @@ impl Receiver {
                     if let Some(r) = sess.clock().best_rtt_ms() { extra.insert("rtt".into(), r.into()); }
                     extra.insert("stalls".into(), sess.counters.dropped_awaiting_idr.into());
                     extra.insert("decoder".into(), self.video.describe().into());
+                    if let Some(r) = self.video.rendered() {
+                        let delta = r - last_rendered;
+                        last_rendered = r;
+                        extra.insert("renderFps".into(), ((delta as f64 / self.cfg.stats_every.as_secs_f64() * 10.0).round() / 10.0).into());
+                    }
                     let stats = window.flush(extra);
                     info!("stats {stats}");
                     if sess.is_connected() { vec![sess.control(&ControlMessage::Stats(stats))] } else { vec![] }
@@ -277,6 +285,7 @@ impl Receiver {
                 let _ = s.write_all(&bytes).await;
             }
         }
+        report.rendered_frames = self.video.rendered();
         info!("{report:?}");
         Ok(report)
     }

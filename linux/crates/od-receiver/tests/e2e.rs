@@ -99,6 +99,7 @@ async fn decodes_with_fakesink_when_a_decoder_is_installed() {
         decoder: "decodebin3".into(),
         fullscreen: false,
         output: None,
+        videoconvert: true,
     }) {
         Ok(v) => v,
         Err(e) => {
@@ -126,4 +127,20 @@ async fn decodes_with_fakesink_when_a_decoder_is_installed() {
     assert_eq!(report.video_frames, s.frames_sent);
     assert_eq!(report.decoder_resets, 2, "connect + SPS change: {report:?}");
     assert_eq!(report.decode_errors, 0, "{report:?}");
+    let rendered = report
+        .rendered_frames
+        .expect("gst backend counts rendered frames");
+    assert!(
+        rendered >= s.frames_sent / 2,
+        "frames must reach the sink: rendered {rendered} of {}",
+        s.frames_sent
+    );
+    let rendered = report
+        .rendered_frames
+        .expect("gst backend counts rendered frames");
+    assert!(
+        rendered >= s.frames_sent / 2,
+        "frames must reach the sink: rendered {rendered} of {}",
+        s.frames_sent
+    );
 }

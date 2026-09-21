@@ -39,6 +39,8 @@ pub struct VideoConfig {
     pub fullscreen: bool,
     /// `wl_output` name for `waylandsink fullscreen-output`.
     pub output: Option<String>,
+    /// Insert `videoconvert` before the sink (see `launch_description`).
+    pub videoconvert: bool,
 }
 
 pub trait VideoOutput: Send {
@@ -51,6 +53,10 @@ pub trait VideoOutput: Send {
     fn poll_error(&mut self) -> Option<String>;
     /// Human-readable description of the decode/present path.
     fn describe(&mut self) -> String;
+    /// Frames that actually reached the sink, when the backend can tell.
+    fn rendered(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Counts frames and does nothing else.
@@ -92,6 +98,8 @@ pub mod gst_out {
     use gst::prelude::*;
     use gstreamer as gst;
     use gstreamer_app as gst_app;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tracing::{info, warn};
 
     pub struct GstOutput {
@@ -99,6 +107,9 @@ pub mod gst_out {
         pipeline: gst::Pipeline,
         appsrc: gst_app::AppSrc,
         decoder_name: Option<String>,
+        rendered: Arc<AtomicU64>,
+        pushed: u64,
+        warned_stall: bool,
     }
 
     fn launch_description(cfg: &VideoConfig) -> String {
@@ -120,12 +131,29 @@ pub mod gst_out {
         // appsrc is unbounded and never drops: dropping *encoded* frames would
         // break the reference chain. Latest-wins happens after the decoder, in
         // the single-buffer leaky queue in front of the sink.
+        //
+        // videoconvert sits *after* the queue so only frames that will be shown
+        // are converted; it is passthrough when the sink takes the decoder's
+        // format directly. It is needed because waylandsink's shm path only
+        // offers the RGB formats the compositor advertises (no I420/NV12 on
+        // e.g. virtio-gpu), and software decoders output I420. On hardware
+        // with a dmabuf-capable sink and VA decoder this element should be
+        // bypassed (--no-videoconvert) to keep the zero-copy path.
+        //
+        // The identity element carries a pad probe that counts frames that
+        // actually reach the sink, so "pushed" and "rendered" never get
+        // conflated in stats again.
+        let convert = if cfg.videoconvert {
+            "! videoconvert "
+        } else {
+            ""
+        };
         format!(
             "appsrc name=src is-live=true format=time do-timestamp=true block=false max-bytes=0 \
              caps=video/x-h264,stream-format=byte-stream,alignment=au \
              ! h264parse ! {decoder} \
              ! queue name=present max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream \
-             ! {sink}",
+             {convert}! identity name=rendered silent=true ! {sink}",
             decoder = cfg.decoder,
         )
     }
@@ -158,6 +186,16 @@ pub mod gst_out {
                 .context("appsrc missing")?
                 .downcast::<gst_app::AppSrc>()
                 .map_err(|_| anyhow!("src is not an appsrc"))?;
+            let rendered = Arc::new(AtomicU64::new(0));
+            let counter = rendered.clone();
+            let probe_pad = pipeline
+                .by_name("rendered")
+                .and_then(|e| e.static_pad("src"))
+                .context("identity pad")?;
+            probe_pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
             pipeline
                 .set_state(gst::State::Playing)
                 .context("starting pipeline")?;
@@ -167,6 +205,9 @@ pub mod gst_out {
                 pipeline,
                 appsrc,
                 decoder_name: None,
+                rendered,
+                pushed: 0,
+                warned_stall: false,
             })
         }
 
@@ -225,6 +266,17 @@ pub mod gst_out {
             self.appsrc
                 .push_buffer(buffer)
                 .map_err(|e| anyhow!("appsrc push: {e:?}"))?;
+            self.pushed += 1;
+            // A pipeline that accepts frames but never shows one is a
+            // negotiation problem hiding behind the leaky queue; say so once.
+            if !self.warned_stall && self.pushed >= 60 && self.rendered.load(Ordering::Relaxed) == 0
+            {
+                self.warned_stall = true;
+                warn!(
+                    "{} frames pushed, none reached the sink: check caps negotiation (GST_DEBUG=3)",
+                    self.pushed
+                );
+            }
             Ok(())
         }
 
@@ -268,6 +320,10 @@ pub mod gst_out {
                 Some(d) => format!("{d} -> {}", self.desc.rsplit("! ").next().unwrap_or("?")),
                 None => self.desc.clone(),
             }
+        }
+
+        fn rendered(&self) -> Option<u64> {
+            Some(self.rendered.load(Ordering::Relaxed))
         }
     }
 
