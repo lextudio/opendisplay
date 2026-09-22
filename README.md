@@ -6,9 +6,9 @@
 
 **Turn your spare Apple devices into second monitors for your Mac — free, open source, no subscription.**
 
-iPhone, iPad, and spare Macs. A self-hosted way to add a true extended display
-(not just mirroring) to your Mac over USB or WiFi, with Retina-sharp output
-plus touch and scroll input.
+iPhone, iPad, and spare Macs. An auditable, device-to-device way to add a true
+extended display (not just mirroring) to your Mac over USB or WiFi, with
+Retina-sharp output plus touch and scroll input.
 
 [Website](https://peetzweg.github.io/opendisplay/) · [Quick start](#quick-start) · [How it works](#how-it-works) · [FAQ](#faq) · [Contributing](#contributing)
 
@@ -59,8 +59,19 @@ transport, input injection) are already working.
 - 💻 **A spare Mac as a display** — install the small *OpenDisplay
   Receiver* app (macOS 12+) on an old Mac and any other Mac extends onto it
   over WiFi or a Thunderbolt/Ethernet cable, at native Retina resolution.
-- 🔒 **Self-hosted & private** — your screen never touches anyone's server.
-  Two small apps, one TCP connection, that's it.
+- 🔒 **Auditable & private** — a direct connection between your devices, no
+  accounts, and no relay server in the middle.
+
+## Comparison
+
+| | OpenDisplay | Apple Sidecar | Duet Display | Luna Display |
+|---|---|---|---|---|
+| iPhone as display | ✅ | ❌ | ✅ | ✅ |
+| iPad as display | ✅ | ✅ | ✅ | ✅ |
+| Mac as display | ✅ | ❌ | ✅ | ✅ |
+| Different Apple IDs | ✅ | ❌ | ✅ | ✅ |
+| Wired (USB) | ✅ | ✅ | ✅ | ❌ |
+| Open source / auditable | ✅ | ❌ | ❌ | ❌ |
 
 ## FAQ
 
