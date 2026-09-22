@@ -81,6 +81,9 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: Mac/OpenSidecarMac.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # The embedded Sparkle.framework is referenced as @rpath; without this
+        # the app cannot resolve it at launch (Library not loaded: Sparkle).
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
       configs:
         # Local dev builds get their own identity: TCC keys permission
         # grants by bundle ID + code signature, so a Debug build sharing
@@ -138,6 +141,8 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_ENTITLEMENTS: MacReceiver/OpenSidecarMacReceiver.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Same embedded-Sparkle @rpath requirement as the sender app.
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
       configs:
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.peetzweg.opensidecar.mac.receiver.debug
@@ -164,6 +169,7 @@ targets:
         # into it, so there is no app to inject into and nothing to load from.
         TEST_HOST: ""
         BUNDLE_LOADER: ""
+        PRODUCT_NAME: $(TARGET_NAME)
         # Without this the bundle has no Info.plist and code signing refuses to
         # run, which fails the build before a single test executes.
         GENERATE_INFOPLIST_FILE: "YES"
