@@ -62,16 +62,16 @@ transport, input injection) are already working.
 - 🔒 **Auditable & private** — a direct connection between your devices, no
   accounts, and no relay server in the middle.
 
-## Comparison
+## Receiver options
 
-| | OpenDisplay | Apple Sidecar | Duet Display | Luna Display |
-|---|---|---|---|---|
-| iPhone as display | ✅ | ❌ | ✅ | ✅ |
-| iPad as display | ✅ | ✅ | ✅ | ✅ |
-| Mac as display | ✅ | ❌ | ✅ | ✅ |
-| Different Apple IDs | ✅ | ❌ | ✅ | ✅ |
-| Wired (USB) | ✅ | ✅ | ✅ | ❌ |
-| Open source / auditable | ✅ | ❌ | ❌ | ❌ |
+| | iPhone | iPad | Spare Mac |
+|---|---|---|---|
+| App | OpenDisplay | OpenDisplay | OpenDisplay Receiver |
+| OS | iOS 15+ | iPadOS 15+ | macOS 12+ |
+| Connection | USB or WiFi | USB or WiFi | WiFi, Thunderbolt/USB4, Ethernet, or USB-C networking |
+| Best for | Portable extra screen | Larger touch display | Desk setup or reusing an older Mac |
+| Touch input | ✅ | ✅ | ❌ |
+| Retina output | ✅ | ✅ | ✅ |
 
 ## FAQ
 
