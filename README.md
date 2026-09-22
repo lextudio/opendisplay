@@ -68,7 +68,7 @@ transport, input injection) are already working.
 |---|---|---|---|
 | App | OpenDisplay | OpenDisplay | OpenDisplay Receiver |
 | OS | iOS 15+ | iPadOS 15+ | macOS 12+ |
-| Connection | USB or WiFi | USB or WiFi | WiFi, Thunderbolt/USB4, Ethernet, or USB-C networking |
+| Connection | USB or WiFi | USB or WiFi | WiFi or wired networking over Thunderbolt, Ethernet, or USB-C |
 | Best for | Portable extra screen | Larger touch display | Desk setup or reusing an older Mac |
 | Touch input | ✅ | ✅ | ❌ |
 | Retina output | ✅ | ✅ | ✅ |
