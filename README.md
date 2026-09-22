@@ -6,10 +6,9 @@
 
 **Turn your spare Apple devices into second monitors for your Mac — free, open source, no subscription.**
 
-iPhone, iPad, and spare Macs. A self-hosted
-alternative to Apple Sidecar, Duet Display, and Luna Display: true extended
-display (not just mirroring), Retina-sharp, over USB or WiFi, with touch and
-scroll input.
+iPhone, iPad, and spare Macs. A self-hosted way to add a true extended display
+(not just mirroring) to your Mac over USB or WiFi, with Retina-sharp output
+plus touch and scroll input.
 
 [Website](https://peetzweg.github.io/opendisplay/) · [Quick start](#quick-start) · [How it works](#how-it-works) · [FAQ](#faq) · [Contributing](#contributing)
 
@@ -28,19 +27,14 @@ scroll input.
 
 ## Why OpenDisplay exists
 
-Turning an iPhone or iPad into an external display for a Mac is a solved
-problem — but every existing option has a catch:
+OpenDisplay exists to make the Apple devices you already own useful as extra
+displays for your Mac. It focuses on a **free, open-source, no-account**
+setup with true display extension, low-latency streaming, and direct control
+over how the connection works.
 
-- **Apple Sidecar** is free but requires both devices on the *same Apple ID*,
-  doesn't support iPhones at all, and only works on supported hardware pairs.
-- **Duet Display** moved to a subscription.
-- **Luna Display** requires a hardware dongle.
-
-OpenDisplay is the missing option: a **free, open-source, no-account,
-no-dongle** way to use the iOS device you already own as a true second
-display. If you were about to write your own — don't! Contribute here
-instead; the hard parts (virtual display creation, low-latency H.264
-pipeline, USB transport, input injection) are already working.
+If you were about to build something similar, contribute here instead; the
+hard parts (virtual display creation, low-latency H.264 pipeline, USB
+transport, input injection) are already working.
 
 ## Features
 
@@ -68,26 +62,13 @@ pipeline, USB transport, input injection) are already working.
 - 🔒 **Self-hosted & private** — your screen never touches anyone's server.
   Two small apps, one TCP connection, that's it.
 
-## Comparison
-
-| | OpenDisplay | Apple Sidecar | Duet Display | Luna Display |
-|---|---|---|---|---|
-| Price | **Free, open source** | Free | Subscription | $$$ + dongle |
-| iPhone as display | ✅ | ❌ (iPad only) | ✅ | ✅ |
-| Different Apple IDs | ✅ | ❌ | ✅ | ✅ |
-| Wired (USB) | ✅ | ✅ | ✅ | ❌ |
-| True extension | ✅ | ✅ | ✅ | ✅ |
-| Touch input | ✅ | ✅ | ✅ | ✅ |
-| Self-hosted / auditable | ✅ | — | ❌ | ❌ |
-
 ## FAQ
 
 **Why do I see the purple screen-recording indicator in the menu bar?**
 That's a macOS privacy indicator shown for *any* app that captures the
-screen — Duet, Luna, OBS, and Zoom trigger it too. Apple Sidecar doesn't,
-only because it's implemented inside the OS rather than on public capture
-APIs. It cannot (and shouldn't) be hidden by an app; it's how macOS tells
-you a capture is running.
+screen. OpenDisplay uses the public capture APIs, so the indicator stays
+visible while streaming. It cannot (and shouldn't) be hidden by an app; it's
+how macOS tells you a capture is running.
 
 **The Mac app doesn't show my iPhone in the Connection menu (WiFi).**
 Both sides need **Local Network** permission, and both fail *silently*
@@ -445,6 +426,6 @@ remain available under MIT.)
 
 ---
 
-*Keywords: iPhone second monitor Mac, iPad external display, free Sidecar
-alternative, Duet Display alternative, open source screen extension macOS,
-use iPhone as extra screen, virtual display Mac, USB second display.*
+*Keywords: iPhone second monitor Mac, iPad external display, open source
+screen extension macOS, use iPhone as extra screen, virtual display Mac, USB
+second display.*
