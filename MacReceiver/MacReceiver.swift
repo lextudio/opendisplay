@@ -35,6 +35,8 @@ final class ReceiverController: ObservableObject {
     private var sleepActivity: NSObjectProtocol?
     private var screenObserver: NSObjectProtocol?
     private var screenSleepObservers: [NSObjectProtocol] = []
+    private var fullscreenSession = FullscreenSessionState()
+    private var fullscreenReconnectTimer: DispatchWorkItem?
 
     private var fallbackName: String { Host.current().localizedName ?? "Mac" }
 
@@ -60,7 +62,7 @@ final class ReceiverController: ObservableObject {
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] connected in
-                self?.connected = connected
+                self?.handleConnectionChange(connected)
             }
             .store(in: &cancellables)
         // Streaming = connected and the video format is known — that's when
@@ -115,6 +117,8 @@ final class ReceiverController: ObservableObject {
     func stop(completion: (() -> Void)? = nil) {
         guard let receiver else { completion?(); return }
         cancellables.removeAll()
+        fullscreenReconnectTimer?.cancel()
+        fullscreenReconnectTimer = nil
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
         screenObserver = nil
         let workspace = NSWorkspace.shared.notificationCenter
@@ -124,6 +128,7 @@ final class ReceiverController: ObservableObject {
         self.receiver = nil
         connected = false
         streaming = false
+        fullscreenSession.beginNextSession()
         closeWindow()
         updateSleepAssertion(false)
         Log.info("receiver mode stopped")
@@ -134,6 +139,22 @@ final class ReceiverController: ObservableObject {
     func setAdvertisedName(_ name: String) {
         UserDefaults.standard.set(name, forKey: "receiverName")
         receiver?.setServiceName(name)
+    }
+
+    /// A sender can reconnect after a brief network interruption. Keep a local
+    /// fullscreen exit through that grace period, then re-arm the default once
+    /// the session is genuinely over.
+    private func handleConnectionChange(_ connected: Bool) {
+        self.connected = connected
+        fullscreenReconnectTimer?.cancel()
+        fullscreenReconnectTimer = nil
+        guard !connected else { return }
+
+        let timer = DispatchWorkItem { [weak self] in
+            self?.fullscreenSession.beginNextSession()
+        }
+        fullscreenReconnectTimer = timer
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(10), execute: timer)
     }
 
     /// The panel this Mac offers as a display: the primary screen's current
@@ -196,6 +217,10 @@ final class ReceiverController: ObservableObject {
         if receiver.videoSize != .zero { window?.contentAspectRatio = receiver.videoSize }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if fullscreenSession.consumeAutoEnterFullscreen(), let window,
+           !window.styleMask.contains(.fullScreen) {
+            window.toggleFullScreen(nil)
+        }
     }
 
     private func closeWindow() {
