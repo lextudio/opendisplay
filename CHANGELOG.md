@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.1](https://github.com/peetzweg/opendisplay/compare/v1.21.0...v1.21.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **readme:** use a transparent app icon ([#305](https://github.com/peetzweg/opendisplay/issues/305)) ([71ed45d](https://github.com/peetzweg/opendisplay/commit/71ed45d907012a58beae225449822f04c9bf0b45))
+
 ## [1.21.0](https://github.com/peetzweg/opendisplay/compare/v1.20.0...v1.21.0) (2026-09-18)
 
 
