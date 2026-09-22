@@ -183,6 +183,11 @@ final class StreamReceiver: ObservableObject {
     /// ever sent by a host whose user enabled audio forwarding, and only after
     /// this receiver advertised support in `hello`, so old peers never see them.
     var onAudioFrame: ((_ pcm: Data) -> Void)?
+    /// The forwarded-audio operating point (announced just before the first
+    /// audio frame). `cookie` is the AAC decoder magic cookie, if any. Called
+    /// on the receiver queue.
+    var onAudioConfig: ((_ codec: String, _ sampleRate: Int, _ channels: Int,
+                         _ cookie: Data?) -> Void)?
     /// Playback gain for forwarded audio (0…1), set from the Mac's menu.
     var onAudioVolume: ((_ volume: Float) -> Void)?
     // Host power state (main thread). The iOS app uses these to dim the screen
@@ -862,6 +867,12 @@ final class StreamReceiver: ObservableObject {
         case WireMessage.audioVolume:
             let volume = Float(obj["v"] as? Double ?? 1)
             DispatchQueue.main.async { self.onAudioVolume?(volume) }
+        case WireMessage.audioConfig:
+            let codec = (obj["codec"] as? String)?.lowercased() ?? "pcm_s16le"
+            let sampleRate = obj["sampleRate"] as? Int ?? 48000
+            let channels = obj["channels"] as? Int ?? 2
+            let cookie = (obj["cookie"] as? String).flatMap { Data(base64Encoded: $0) }
+            onAudioConfig?(codec, sampleRate, channels, cookie)
         default:
             break
         }
@@ -946,8 +957,10 @@ final class StreamReceiver: ObservableObject {
         hello["videoCaps"] = videoCaps
         // Additive: system-audio forwarding. The host only sends audio when its
         // user opts in AND this field is present, so old hosts/receivers are
-        // unaffected. Fixed format keeps the MVP simple; codec is additive.
-        hello["audio"] = ["codec": "pcm_s16le", "sampleRate": 48000, "channels": 2]
+        // unaffected. `codec` stays PCM for old senders; `codecs` lists what
+        // this build can decode so a newer sender may pick AAC instead.
+        hello["audio"] = ["codec": "pcm_s16le", "codecs": ["pcm_s16le", "aac"],
+                          "sampleRate": 48000, "channels": 2]
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
         let announcesCursorPort = includeCursorPort && cursorListenerReady

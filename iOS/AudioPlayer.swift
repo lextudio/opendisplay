@@ -1,4 +1,5 @@
 import AVFoundation
+import AudioToolbox
 
 /// Plays forwarded system audio (PCM s16le, 48 kHz stereo) from the Mac host.
 ///
@@ -35,9 +36,74 @@ final class AudioPlayer {
     private var loggedFirst = false
     private var volume: Float = 1
 
-    /// Feed one PCM s16le interleaved stereo frame. Safe from any queue.
-    func play(_ pcm: Data) {
-        queue.async { [weak self] in self?.enqueue(pcm) }
+    // Forwarded-audio codec, announced by the host just before the first frame.
+    // `pcm_s16le` is the default so a host that never announces stays working.
+    private var codec = "pcm_s16le"
+    private var aacConverter: AudioConverterRef?
+    private var aacCookie: Data?
+    private var aacSourceRate: Double = 48_000
+    private var aacChannels: UInt32 = 2
+
+    /// One AAC access unit handed to `AudioConverterFillComplexBuffer` through
+    /// its user-data pointer (a C callback cannot capture context). The packet
+    /// description is required: AAC is variable-rate, so the decoder cannot
+    /// infer the access unit's size from the buffer alone.
+    private struct AACInput {
+        var data: UnsafeRawPointer
+        var size: UInt32
+        var channels: UInt32
+        var consumed: Bool
+        var descriptionPtr: UnsafeMutablePointer<AudioStreamPacketDescription>?
+    }
+
+    private static let aacInputProc: AudioConverterComplexInputDataProc = {
+        _, ioNumberDataPackets, ioData, outDescription, inUserData in
+        guard let inUserData else { ioNumberDataPackets.pointee = 0; return noErr }
+        let input = inUserData.assumingMemoryBound(to: AACInput.self)
+        guard !input.pointee.consumed else {
+            ioNumberDataPackets.pointee = 0
+            return noErr
+        }
+        input.pointee.consumed = true
+        ioNumberDataPackets.pointee = 1
+        let list = UnsafeMutableAudioBufferListPointer(ioData)
+        list[0].mNumberChannels = input.pointee.channels
+        list[0].mDataByteSize = input.pointee.size
+        list[0].mData = UnsafeMutableRawPointer(mutating: input.pointee.data)
+        if let descriptionPtr = input.pointee.descriptionPtr, let outDescription {
+            outDescription.pointee = descriptionPtr
+        }
+        return noErr
+    }
+
+    /// Set the wire codec for forwarded audio. Safe from any queue.
+    func configure(codec: String, sampleRate: Int, channels: Int, cookie: Data?) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.codec = codec
+            self.aacSourceRate = Double(sampleRate)
+            self.aacChannels = UInt32(max(1, channels))
+            self.aacCookie = cookie
+            if let converter = self.aacConverter {
+                AudioConverterDispose(converter)
+                self.aacConverter = nil
+            }
+            Log.info("audio: codec \(codec) \(sampleRate)Hz x\(channels)"
+                + (cookie.map { " cookie=\($0.count)B" } ?? ""))
+        }
+    }
+
+    /// Feed one forwarded-audio frame (PCM s16le or one AAC access unit,
+    /// depending on the last `configure`). Safe from any queue.
+    func play(_ data: Data) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if self.codec == "aac" {
+                self.decodeAAC(data)
+            } else {
+                self.enqueue(data)
+            }
+        }
     }
 
     /// Playback gain (0…1) driven from the Mac's menu.
@@ -61,6 +127,86 @@ final class AudioPlayer {
             try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
             Log.info("audio: stopped")
         }
+    }
+
+    /// Lazily build the AAC -> s16le converter from the host's magic cookie.
+    /// The wire carries raw access units (the length prefix frames them), so
+    /// the cookie is the only out-of-band configuration the decoder needs.
+    private func ensureAACConverter() -> Bool {
+        if aacConverter != nil { return true }
+        var source = AudioStreamBasicDescription(
+            mSampleRate: aacSourceRate,
+            mFormatID: kAudioFormatMPEG4AAC,
+            mFormatFlags: 2,   // kMPEG4Object_AAC_LC (not exposed to Swift)
+            mBytesPerPacket: 0,
+            mFramesPerPacket: 1024,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: aacChannels,
+            mBitsPerChannel: 0,
+            mReserved: 0)
+        var destination = AudioStreamBasicDescription(
+            mSampleRate: aacSourceRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 2 * aacChannels,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 2 * aacChannels,
+            mChannelsPerFrame: aacChannels,
+            mBitsPerChannel: 16,
+            mReserved: 0)
+        var converter: AudioConverterRef?
+        guard AudioConverterNew(&source, &destination, &converter) == noErr,
+              let converter else {
+            Log.info("audio: AAC decoder unavailable")
+            return false
+        }
+        if let cookie = aacCookie, !cookie.isEmpty {
+            var bytes = [UInt8](cookie)
+            let status = AudioConverterSetProperty(converter,
+                                                   kAudioConverterDecompressionMagicCookie,
+                                                   UInt32(bytes.count), &bytes)
+            if status != noErr { Log.info("audio: AAC cookie rejected (\(status))") }
+        }
+        aacConverter = converter
+        return true
+    }
+
+    /// Decode one AAC access unit to s16le and hand it to the PCM path.
+    private func decodeAAC(_ frame: Data) {
+        guard ensureAACConverter(), let converter = aacConverter else { return }
+        let maxFrames = 1024
+        var pcm = Data()
+        frame.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var description = AudioStreamPacketDescription(
+                mStartOffset: 0, mVariableFramesInPacket: 1024,
+                mDataByteSize: UInt32(frame.count))
+            var outputFrames = UInt32(maxFrames)
+            var samples = [Int16](repeating: 0, count: maxFrames * Int(aacChannels))
+            withUnsafeMutablePointer(to: &description) { descriptionPtr in
+                var input = AACInput(data: base, size: UInt32(frame.count),
+                                     channels: aacChannels, consumed: false,
+                                     descriptionPtr: descriptionPtr)
+                samples.withUnsafeMutableBytes { outRaw in
+                    var list = AudioBufferList(
+                        mNumberBuffers: 1,
+                        mBuffers: AudioBuffer(
+                            mNumberChannels: aacChannels,
+                            mDataByteSize: UInt32(outRaw.count),
+                            mData: outRaw.baseAddress))
+                    let status = withUnsafeMutablePointer(to: &input) { inputPtr in
+                        AudioConverterFillComplexBuffer(converter, Self.aacInputProc, inputPtr,
+                                                        &outputFrames, &list, nil)
+                    }
+                    if status == noErr, outputFrames > 0, let base = outRaw.baseAddress {
+                        pcm = Data(bytes: base, count: Int(outputFrames) * 2 * Int(aacChannels))
+                    } else if status != noErr {
+                        Log.info("audio: AAC decode failed (\(status))")
+                    }
+                }
+            }
+        }
+        if !pcm.isEmpty { enqueue(pcm) }
     }
 
     private func enqueue(_ pcm: Data) {

@@ -55,6 +55,9 @@ struct AudioCapability: Decodable, Equatable {
     let codec: String
     let sampleRate: Int?
     let channels: Int?
+    // Codecs the receiver can decode. Absent on old receivers, which implies
+    // PCM only; when present the sender may pick a smaller codec.
+    let codecs: [String]?
 }
 
 /// How the sender reaches the receiver. Reconnects re-dial from scratch, so
@@ -120,6 +123,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                                   sampleRate: 48_000, channels: 2,
                                                   interleaved: true)
     private var audioForwarding = false
+    // Wire codec for forwarded audio: AAC when the receiver listed it (about a
+    // fifth of PCM's bandwidth), otherwise PCM s16le.
+    private var audioCodec = "pcm_s16le"
+    private var audioAACConverter: AVAudioConverter?
+    // Consecutive encode calls that produced no packet (the encoder's initial
+    // 1024-sample priming is normal; a long streak is not).
+    private var audioAACEmptyStreak = 0
+    // The AAC decoder magic cookie the receiver must configure with; captured
+    // from the encoder and sent (base64) in the audioConfig message.
+    private var audioAACCookie: Data?
+    private let audioAACFormat = AVAudioFormat(settings: [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: 48_000.0,
+        AVNumberOfChannelsKey: 2,
+        AVEncoderBitRateKey: 64_000,
+    ])
     private var audioSawBuffer = false
     private var audioSentOnce = false
     private var audioLoggedEmpty = false
@@ -448,6 +467,24 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func audioVolumeJSON(_ volume: Float) -> String {
         "{\"type\":\"\(WireMessage.audioVolume)\",\"v\":\(Double(volume))}"
+    }
+
+    /// Tell the receiver which codec the audio frames will use (and, for AAC,
+    /// the decoder cookie). Sent only while forwarding is active; a receiver
+    /// that never gets it assumes PCM.
+    private func sendAudioConfiguration(on connection: NWConnection? = nil) {
+        guard audioForwarding else { return }
+        var json = "{\"type\":\"\(WireMessage.audioConfig)\",\"codec\":\"\(audioCodec)\","
+            + "\"sampleRate\":48000,\"channels\":2"
+        if audioCodec == "aac", let cookie = audioAACCookie, !cookie.isEmpty {
+            json += ",\"cookie\":\"\(cookie.base64EncodedString())\""
+        }
+        json += "}"
+        if let connection {
+            sendJSONFrame(json, on: connection)
+        } else {
+            sendJSONFrame(json)
+        }
     }
 
     static func storedAudioVolume() -> Float {
@@ -993,7 +1030,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // System audio rides the same stream as an optional second output, only
         // when the user enabled it and the receiver advertised support.
         audioForwarding = audioForwardRequested && info.audio != nil
-        Log.info("audio: requested=\(audioForwardRequested) receiverSupports=\(info.audio != nil) forwarding=\(audioForwarding)")
+        // Pick AAC only when the receiver explicitly listed it, so an old
+        // receiver that omits `codecs` keeps getting PCM.
+        audioCodec = (info.audio?.codecs?.contains("aac") ?? false) ? "aac" : "pcm_s16le"
+        audioAACConverter = nil
+        Log.info("audio: requested=\(audioForwardRequested) receiverSupports=\(info.audio != nil) forwarding=\(audioForwarding) codec=\(audioCodec)")
         if audioForwarding {
             config.capturesAudio = true
             config.sampleRate = 48_000
@@ -1365,6 +1406,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // A reconnecting receiver starts at its own default gain; resend the
         // user's chosen level so the forwarded audio comes back at the same volume.
         sendAudioVolume(on: conn)
+        // Announce the audio operating point before any audio frame so the
+        // receiver knows whether to expect PCM or AAC access units.
+        sendAudioConfiguration(on: conn)
         // Keep cached pixels: ScreenCaptureKit stays quiet on a static
         // display, and the watchdog needs them to force the reconnect IDR.
         cancelDropReplayTimer()
@@ -2428,8 +2472,75 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             return
         }
-        let pcm = Data(bytes: samples, count: Int(output.frameLength) * 2 * 2)  // stereo s16
-        queue.async { [weak self] in self?.sendAudioFrame(pcm) }
+        if audioCodec == "aac" {
+            guard let frames = encodeAAC(output) else { return }
+            queue.async { [weak self] in
+                for frame in frames { self?.sendAudioFrame(frame) }
+            }
+        } else {
+            let pcm = Data(bytes: samples, count: Int(output.frameLength) * 2 * 2)  // stereo s16
+            queue.async { [weak self] in self?.sendAudioFrame(pcm) }
+        }
+    }
+
+    /// Encode one PCM buffer to AAC access units (raw, no ADTS: the wire length
+    /// prefix frames each one, and the receiver holds the decoder cookie).
+    /// Runs on `audioQueue`.
+    private func encodeAAC(_ pcm: AVAudioPCMBuffer) -> [Data]? {
+        guard let aacFormat = audioAACFormat else { return nil }
+        if audioAACConverter == nil {
+            audioAACConverter = AVAudioConverter(from: pcm.format, to: aacFormat)
+            guard let converter = audioAACConverter else {
+                Log.info("audio: AAC encoder unavailable — falling back to PCM")
+                audioCodec = "pcm_s16le"
+                queue.async { [weak self] in self?.sendAudioConfiguration() }
+                return nil
+            }
+            // The receiver configures its decoder with this cookie; capture it
+            // before the audioConfig message is sent with the first frame.
+            audioAACCookie = converter.magicCookie
+        }
+        guard let converter = audioAACConverter else { return nil }
+        // AAC-LC encodes 1024 samples per frame; allow a little headroom.
+        let capacity = AVAudioPacketCount(max(1, Int(pcm.frameLength) / 1024 + 1))
+        let compressed = AVAudioCompressedBuffer(
+            format: aacFormat, packetCapacity: capacity,
+            maximumPacketSize: converter.maximumOutputPacketSize)
+        var fed = false
+        var error: NSError?
+        let status = converter.convert(to: compressed, error: &error) { _, outStatus in
+            if fed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            fed = true
+            outStatus.pointee = .haveData
+            return pcm
+        }
+        guard status != .error, compressed.packetCount > 0 else {
+            // The encoder buffers until it has a full 1024-sample frame, so the
+            // first few calls legitimately produce nothing. Only complain if it
+            // never produces anything.
+            audioAACEmptyStreak += 1
+            if audioAACEmptyStreak == 100, !audioLoggedEmpty {
+                audioLoggedEmpty = true
+                Log.info("audio: AAC encode produced nothing for \(audioAACEmptyStreak) buffers (error=\(error?.localizedDescription ?? "none"))")
+            }
+            return nil
+        }
+        audioAACEmptyStreak = 0
+        var frames: [Data] = []
+        if let descriptions = compressed.packetDescriptions {
+            let base = compressed.data
+            for index in 0..<Int(compressed.packetCount) {
+                let description = descriptions[index]
+                frames.append(Data(bytes: base.advanced(by: Int(description.mStartOffset)),
+                                   count: Int(description.mDataByteSize)))
+            }
+        } else {
+            frames.append(Data(bytes: compressed.data, count: Int(compressed.byteLength)))
+        }
+        return frames
     }
 
     /// Wrap a CMSampleBuffer's PCM in an AVAudioPCMBuffer of its own format so
@@ -2470,7 +2581,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard audioForwarding, connectionReady, let connection else { return }
         if !audioSentOnce {
             audioSentOnce = true
-            Log.info("audio: first frame sent (\(pcm.count) bytes)")
+            // Same queue as the frame itself, so the receiver always learns the
+            // codec (and AAC cookie) before the first audio frame arrives.
+            sendAudioConfiguration(on: connection)
+            Log.info("audio: first frame sent (\(pcm.count) bytes) codec=\(audioCodec)")
         }
         audioFramesSent += 1
         if audioFramesSent % 100 == 0 {

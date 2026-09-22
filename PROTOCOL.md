@@ -359,6 +359,10 @@ section 4.
 | `welcome` | pv 2 | `pv`, `min` | Sender's side of the version handshake |
 | `updateRequired` | pv 2 | `target`, `store`, `message` | Peer must update to continue |
 | `streamConfig` | pv 3 (additive) | `codec`, `width`, `height`, `framesPerSecond` | Selected video operating point |
+| `audioConfig` | pv 3 (additive) | `codec`, `sampleRate`, `channels`, `cookie`? | Forwarded-audio operating point (6.6) |
+| `audioVolume` | pv 3 (additive) | `v` | Forwarded-audio playback gain (6.6) |
+| `hostSleeping` | pv 3 (additive) | `displaySleepAfter`? | Host screen locked / going to sleep (6.6) |
+| `hostAwake` | pv 3 (additive) | — | Host woke; restore the receiver's display (6.6) |
 
 **`pong`** echoes the `t` from the receiver's `ping` unchanged and adds
 `mt`: milliseconds since the Unix epoch on the sender's clock at the moment
@@ -492,11 +496,11 @@ instead of a silent failure.
 
 **`streamConfig`** announces the sender's selected video configuration before
 the first video frame and again after a reconnect or stream reconfiguration.
-`codec` is a lowercase token (`"h264"` today); `width` and `height` are encoded
-pixels; `framesPerSecond` is the maximum submission rate. Receivers MUST ignore
-unknown fields. A receiver that gets video without `streamConfig` MUST assume
-the legacy H.264 stream. A sender MUST NOT select a non-H.264 codec unless the
-receiver affirmatively advertised it in `videoCaps`.
+`codec` is a lowercase token (`"h264"` or `"hevc"`); `width` and `height` are
+encoded pixels; `framesPerSecond` is the maximum submission rate. Receivers
+MUST ignore unknown fields. A receiver that gets video without `streamConfig`
+MUST assume the legacy H.264 stream. A sender MUST NOT select a non-H.264
+codec unless the receiver affirmatively advertised it in `videoCaps`.
 
 ### 6.5 Video capabilities and legacy decode ceiling
 
@@ -515,15 +519,55 @@ be freely combined. Unknown codecs and fields MUST be ignored. The sender
 intersects a receiver entry with its own encoder constraints and the requested
 desktop/quality policy, then reports the result with `streamConfig`.
 
-The official receiver currently advertises H.264 only. This structure makes a
-future codec additive without changing the meaning of panel dimensions or
-assuming support from a peer that merely ignored an unknown field.
+The official receiver advertises H.264, and HEVC as a second entry when the
+hardware decodes it (`VTIsHardwareDecodeSupported`). A sender that supports
+HEVC MAY pick it for the better quality-per-bit at the same ceiling, but only
+after seeing the entry. This structure makes a future codec additive without
+changing the meaning of panel dimensions or assuming support from a peer that
+merely ignored an unknown field.
 
 The current H.264 sender also enforces the High@L5.2 frame-size and
 macroblock-rate limits locally. For a 16:9 5K source that codec rule selects
 4096×2304 at 55 FPS; it is not a receiver-model or 5K-iMac exception. A future
 codec supplies its own encoder constraints while using the same capability
 intersection and `streamConfig` announcement.
+
+### 6.6 Forwarded system audio (additive)
+
+The receiver advertises audio support in `hello.audio`:
+
+| Field | Meaning |
+|---|---|
+| `codec` | Legacy preferred codec (`"pcm_s16le"`); a sender that predates `codecs` uses this |
+| `codecs` | Array of decodable codecs, e.g. `["pcm_s16le", "aac"]`; absent means PCM only |
+| `sampleRate`, `channels` | Fixed at 48000 and 2 |
+
+Audio frames are length-prefixed like video, with the high bit set in the
+length word (section 3) so the receiver routes them to playback. They are sent
+only when the sender's user enabled forwarding **and** `hello.audio` was
+present, so a receiver that never advertised audio never sees them.
+
+Before the first audio frame (and again after a reconnect) the sender sends
+**`audioConfig`**:
+
+| Field | Meaning |
+|---|---|
+| `codec` | `"pcm_s16le"` or `"aac"` |
+| `sampleRate`, `channels` | Must match the frames that follow |
+| `cookie` | Base64 AAC decoder magic cookie (AAC only); the receiver configures its `AudioConverter` with it |
+
+A sender MUST NOT pick a codec absent from `hello.audio.codecs`, and MUST send
+`audioConfig` before the frames so the receiver knows how to decode them. A
+receiver that never gets `audioConfig` MUST assume PCM. Raw AAC access units
+carry no ADTS header: the frame length prefix delimits each one, and the cookie
+supplies the rest of the decoder configuration.
+
+**`audioVolume`** (sender to receiver) carries the playback gain `v` (0…1),
+re-sent after a reconnect. **`hostSleeping`**/**`hostAwake`** tell the receiver
+the host's screen locked or woke; the receiver dims its display (rather than
+sleeping, which would lose the wake path) and restores it on `hostAwake`.
+`hostSleeping` may carry `displaySleepAfter` (seconds) so the receiver mirrors
+the host's own display-sleep delay.
 
 `hello.maxEncodeWide` / `maxEncodeHigh` is the legacy H.264 decode ceiling:
 
@@ -689,6 +733,7 @@ Mechanics at a glance (the policy behind them lives in COMPATIBILITY.md):
 | 3 | `pencil`, `proximity`; below pv 3 the receiver degrades stylus to `touch` |
 | 3 (additive) | `hello.cursorPort` and the UDP cursor side channel (6.3); optional, no bump |
 | 3 (additive) | `hello.videoCaps`, `displayMaxFrameRate`, and `streamConfig` (6.5); legacy peers remain implicit H.264 |
+| 3 (additive) | HEVC in `videoCaps`/`streamConfig`; forwarded system audio: `hello.audio`, `audioConfig`, `audioVolume`, `hostSleeping`, `hostAwake` (6.6) |
 | 4 (reserved) | Typed frame header replacing the section 4 demux heuristic (two-phase migration) |
 
 ---

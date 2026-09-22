@@ -197,6 +197,10 @@ struct ReceiverScreen: View {
                 Task { @MainActor in ScreenDim.shared.dim(deepSleepAfter: after) }
             }
             model.receiver.onHostAwake = { Task { @MainActor in ScreenDim.shared.wake() } }
+            model.receiver.onAudioConfig = { codec, sampleRate, channels, cookie in
+                AudioPlayer.shared.configure(codec: codec, sampleRate: sampleRate,
+                                             channels: channels, cookie: cookie)
+            }
             model.receiver.onAudioFrame = { pcm in AudioPlayer.shared.play(pcm) }
             model.receiver.onAudioVolume = { volume in AudioPlayer.shared.setVolume(volume) }
             model.start()

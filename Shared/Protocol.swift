@@ -42,6 +42,10 @@ enum WireMessage {
     static let hostAwake = "hostAwake"
     // Mac -> receiver: forwarded-audio playback gain (0…1).
     static let audioVolume = "audioVolume"
+    // Mac -> receiver: the forwarded-audio operating point (codec/sample rate/
+    // channels and, for AAC, the decoder magic cookie). Additive: sent only to
+    // receivers that advertised a codec list, so an old receiver keeps PCM.
+    static let audioConfig = "audioConfig"
 }
 
 /// One receiver-supported operating envelope. Every non-nil limit in an
