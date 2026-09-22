@@ -174,6 +174,13 @@ final class StreamReceiver: ObservableObject {
     // Metal renderer path (experimental, "metalRenderer" setting): we decode
     // explicitly and hand BGRA buffers out; called on the receiver queue.
     var onDecodedFrame: ((_ pixelBuffer: CVPixelBuffer, _ captureMs: Double?) -> Void)?
+    // Host power state (main thread). The iOS app uses these to dim the screen
+    // while the Mac is asleep/locked — the device cannot be slept without losing
+    // the ability to be woken by the host's reconnect, so dimming is the lever.
+    // `deepSleepAfter` mirrors the Mac's own display-sleep delay (nil = the Mac
+    // never sleeps its display, so stay dimmed). Only the iOS app sets them.
+    var onHostSleeping: ((_ deepSleepAfter: TimeInterval?) -> Void)?
+    var onHostAwake: (() -> Void)?
     private var decompressionSession: VTDecompressionSession?
     private var decodeWindow: [Double] = []
     private var photonWindow: [Double] = []
@@ -829,6 +836,11 @@ final class StreamReceiver: ObservableObject {
                 ?? "Update OpenDisplay from the App Store to keep using your second display."
             let store = (obj["store"] as? String).flatMap { URL(string: $0) } ?? AppStore.updateURL
             DispatchQueue.main.async { self.peerSignal = .updateReceiver(message: message, storeURL: store) }
+        case WireMessage.hostSleeping:
+            let after = (obj["displaySleepAfter"] as? Int).map { TimeInterval($0) }
+            DispatchQueue.main.async { self.onHostSleeping?(after) }
+        case WireMessage.hostAwake:
+            DispatchQueue.main.async { self.onHostAwake?() }
         default:
             break
         }

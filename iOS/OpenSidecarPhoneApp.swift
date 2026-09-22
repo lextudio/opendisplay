@@ -38,9 +38,14 @@ extension UIWindow {
 struct ReceiverScreen: View {
     @StateObject private var model = ReceiverModel()
     @StateObject private var versionGate = VersionGate()
+    // Published so the black-out overlay below follows the dim state.
+    @ObservedObject private var screenDim = ScreenDim.shared
     @State private var showSettings = false
     @State private var showOnboarding = false
     @State private var nagDismissed = false
+    // Per-launch: whether we have ever been connected, so a launch that starts
+    // disconnected does not immediately dim the screen.
+    @State private var sawConnection = false
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
@@ -89,11 +94,21 @@ struct ReceiverScreen: View {
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings)
                 }
+                // Host away: black out the (light) idle screen. The backlight is
+                // already at 0, but this keeps a restored/ambient-bright screen
+                // from showing white.
+                if screenDim.isDimmed {
+                    Color.black.ignoresSafeArea().allowsHitTesting(false)
+                }
             }
             .onAppear { model.receiver.setOrientation(portrait: geo.size.height > geo.size.width) }
             .onChange(of: geo.size) { size in
                 model.receiver.setOrientation(portrait: size.height > size.width)
             }
+            // A tap anywhere restores a dimmed display (no-op otherwise), so the
+            // user is never stuck on a black screen. Simultaneous so it does not
+            // steal the touch input forwarded to the Mac.
+            .simultaneousGesture(TapGesture().onEnded { ScreenDim.shared.wake() })
             .sheet(isPresented: $showOnboarding) {
                 OnboardingView { onboardingDismissed = true }
             }
@@ -129,7 +144,9 @@ struct ReceiverScreen: View {
         .onChange(of: scenePhase) { phase in
             Log.info("scenePhase -> \(String(describing: phase))")
             switch phase {
-            case .active: model.sceneDidActivate()
+            case .active:
+                model.sceneDidActivate()
+                ScreenDim.shared.wake()   // returning to the app restores a dim
             case .background: model.sceneDidBackground()
             default: break
             }
@@ -160,11 +177,22 @@ struct ReceiverScreen: View {
             // The first valid connection retires the onboarding hint for good.
             if isConnected {
                 hasConnectedBefore = true
+                sawConnection = true
                 showOnboarding = false
+                ScreenDim.shared.wake()
+            } else if sawConnection {
+                // The Mac went away (asleep/locked/unplugged): dim the display
+                // but stay reachable, so its reconnect wakes the screen.
+                ScreenDim.shared.dim()
             }
         }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
+            ScreenDim.shared.restoreIfNeeded()
+            model.receiver.onHostSleeping = { after in
+                Task { @MainActor in ScreenDim.shared.dim(deepSleepAfter: after) }
+            }
+            model.receiver.onHostAwake = { Task { @MainActor in ScreenDim.shared.wake() } }
             model.start()
             // Show the first-run hint unless the device has connected before
             // or the user already dismissed it.

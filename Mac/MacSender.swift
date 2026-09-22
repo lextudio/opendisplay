@@ -339,6 +339,58 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         super.init()
     }
 
+    // MARK: - Host power signalling
+
+    /// Tell the receiver the Mac's screen locked / it is going to sleep, so the
+    /// receiver can dim its display (backlight off) while staying reachable.
+    /// Also carries the Mac's own display-sleep delay so the receiver can mirror
+    /// that timing instead of guessing. Best-effort: the receiver also dims on
+    /// its own when the connection drops, which covers a Mac that sleeps before
+    /// the frame is flushed.
+    func notifyHostSleeping() {
+        queue.async { [weak self] in
+            guard let self, self.connectionReady else { return }
+            var json = "{\"type\":\"\(WireMessage.hostSleeping)\""
+            if let after = MacSender.displaySleepAfterSeconds() {
+                json += ",\"displaySleepAfter\":\(after)"
+            }
+            json += "}"
+            self.sendJSONFrame(json)
+        }
+    }
+
+    /// The user's display-sleep delay in seconds (`pmset -g` `displaysleep`,
+    /// which macOS also applies to a locked screen). The receiver mirrors it for
+    /// its own deep-sleep step. nil when it cannot be read or is set to "never"
+    /// (0) — in that case the receiver stays merely dimmed.
+    static func displaySleepAfterSeconds() -> Int? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        process.arguments = ["-g", "custom"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do { try process.run() } catch { return nil }
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n") {
+            let fields = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            if fields.count >= 2, fields[0] == "displaysleep", let minutes = Int(fields[1]) {
+                return minutes > 0 ? minutes * 60 : nil
+            }
+        }
+        return nil
+    }
+
+    /// The host woke / unlocked: bring a dimmed receiver's display back.
+    func notifyHostAwake() {
+        queue.async { [weak self] in
+            guard let self, self.connectionReady else { return }
+            self.sendJSONFrame("{\"type\":\"\(WireMessage.hostAwake)\"}")
+        }
+    }
+
     // MARK: - Lifecycle
 
     func start() async throws {

@@ -35,6 +35,11 @@ enum WireMessage {
     static let sleeping = "sleeping"                // phone -> Mac: device locked, reconnect on wake
     static let closing = "closing"                  // phone -> Mac: app quit, end the session for good
     static let streamConfig = "streamConfig"        // Mac -> receiver: selected video operating point
+    // Mac -> receiver: the host's screen locked / it is going to sleep, so the
+    // receiver can dim its display (backlight off) while staying reachable, and
+    // come back when the host wakes. Additive: old receivers ignore them.
+    static let hostSleeping = "hostSleeping"
+    static let hostAwake = "hostAwake"
 }
 
 /// One receiver-supported operating envelope. Every non-nil limit in an
