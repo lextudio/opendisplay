@@ -40,6 +40,8 @@ enum WireMessage {
     // come back when the host wakes. Additive: old receivers ignore them.
     static let hostSleeping = "hostSleeping"
     static let hostAwake = "hostAwake"
+    // Mac -> receiver: forwarded-audio playback gain (0…1).
+    static let audioVolume = "audioVolume"
 }
 
 /// One receiver-supported operating envelope. Every non-nil limit in an

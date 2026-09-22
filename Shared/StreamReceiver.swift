@@ -174,6 +174,13 @@ final class StreamReceiver: ObservableObject {
     // Metal renderer path (experimental, "metalRenderer" setting): we decode
     // explicitly and hand BGRA buffers out; called on the receiver queue.
     var onDecodedFrame: ((_ pixelBuffer: CVPixelBuffer, _ captureMs: Double?) -> Void)?
+    /// PCM audio frames (host system audio). Called on the receiver queue; the
+    /// iOS app feeds them straight to AVAudioEngine, which is thread-safe. Only
+    /// ever sent by a host whose user enabled audio forwarding, and only after
+    /// this receiver advertised support in `hello`, so old peers never see them.
+    var onAudioFrame: ((_ pcm: Data) -> Void)?
+    /// Playback gain for forwarded audio (0…1), set from the Mac's menu.
+    var onAudioVolume: ((_ volume: Float) -> Void)?
     // Host power state (main thread). The iOS app uses these to dim the screen
     // while the Mac is asleep/locked — the device cannot be slept without losing
     // the ability to be woken by the host's reconnect, so dimming is the lever.
@@ -841,6 +848,9 @@ final class StreamReceiver: ObservableObject {
             DispatchQueue.main.async { self.onHostSleeping?(after) }
         case WireMessage.hostAwake:
             DispatchQueue.main.async { self.onHostAwake?() }
+        case WireMessage.audioVolume:
+            let volume = Float(obj["v"] as? Double ?? 1)
+            DispatchQueue.main.async { self.onAudioVolume?(volume) }
         default:
             break
         }
@@ -910,6 +920,10 @@ final class StreamReceiver: ObservableObject {
         }
         if let maxPixelsPerSecond { h264["maxPixelsPerSecond"] = maxPixelsPerSecond }
         hello["videoCaps"] = [h264]
+        // Additive: system-audio forwarding. The host only sends audio when its
+        // user opts in AND this field is present, so old hosts/receivers are
+        // unaffected. Fixed format keeps the MVP simple; codec is additive.
+        hello["audio"] = ["codec": "pcm_s16le", "sampleRate": 48000, "channels": 2]
         // Additive capability: only offered while the UDP listener is bound,
         // so a sender never dials a port nobody answers on.
         let announcesCursorPort = includeCursorPort && cursorListenerReady
@@ -1062,12 +1076,22 @@ final class StreamReceiver: ObservableObject {
         // Cursor-based drain so we only compact the buffer once per batch.
         var cursor = buffer.startIndex
         while buffer.distance(from: cursor, to: buffer.endIndex) >= 4 {
-            let len = buffer[cursor..<buffer.index(cursor, offsetBy: 4)]
-                .withUnsafeBytes { Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))) }
+            let raw = buffer[cursor..<buffer.index(cursor, offsetBy: 4)]
+                .withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)) }
+            // The high bit tags a system-audio frame; video/JSON use the plain
+            // length. Audio is only sent to receivers that advertised support,
+            // so an older receiver never has to understand this.
+            let isAudio = raw & 0x8000_0000 != 0
+            let len = Int(raw & 0x7FFF_FFFF)
             guard buffer.distance(from: cursor, to: buffer.endIndex) >= 4 + len else { break }
             let start = buffer.index(cursor, offsetBy: 4)
             let end = buffer.index(start, offsetBy: len)
-            handleAnnexB(Data(buffer[start..<end]))
+            let payload = Data(buffer[start..<end])
+            if isAudio {
+                onAudioFrame?(payload)
+            } else {
+                handleAnnexB(payload)
+            }
             cursor = end
         }
         buffer.removeSubrange(buffer.startIndex..<cursor)

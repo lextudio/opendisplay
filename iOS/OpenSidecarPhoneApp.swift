@@ -147,7 +147,9 @@ struct ReceiverScreen: View {
             case .active:
                 model.sceneDidActivate()
                 ScreenDim.shared.wake()   // returning to the app restores a dim
-            case .background: model.sceneDidBackground()
+            case .background:
+                model.sceneDidBackground()
+                AudioPlayer.shared.stop()
             default: break
             }
         }
@@ -182,7 +184,9 @@ struct ReceiverScreen: View {
                 ScreenDim.shared.wake()
             } else if sawConnection {
                 // The Mac went away (asleep/locked/unplugged): dim the display
-                // but stay reachable, so its reconnect wakes the screen.
+                // but stay reachable, so its reconnect wakes the screen. Audio
+                // has nothing to play, so release the session.
+                AudioPlayer.shared.stop()
                 ScreenDim.shared.dim()
             }
         }
@@ -193,6 +197,8 @@ struct ReceiverScreen: View {
                 Task { @MainActor in ScreenDim.shared.dim(deepSleepAfter: after) }
             }
             model.receiver.onHostAwake = { Task { @MainActor in ScreenDim.shared.wake() } }
+            model.receiver.onAudioFrame = { pcm in AudioPlayer.shared.play(pcm) }
+            model.receiver.onAudioVolume = { volume in AudioPlayer.shared.setVolume(volume) }
             model.start()
             // Show the first-run hint unless the device has connected before
             // or the user already dismissed it.

@@ -18,6 +18,7 @@ import VideoToolbox
 import Network
 import CoreMedia
 import AppKit
+import AVFoundation
 
 enum CaptureMode: String {
     case mirror   // main display (Milestone 1)
@@ -42,9 +43,18 @@ struct PhoneInfo: Decodable {
     let maxEncodeHigh: Int?  //  6.5): cap the stream, keep the desktop size
     let displayMaxFrameRate: Int?       // presentation ceiling; absent = legacy 60
     let videoCaps: [VideoCapability]?   // codec-specific joint decode constraints
+    let audio: AudioCapability?         // system-audio forwarding support (additive)
 
     var kind: String { device ?? "device" }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }
+}
+
+/// What a receiver is willing to play for forwarded system audio. Additive: an
+/// old receiver omits it, so the sender never sends audio to one.
+struct AudioCapability: Decodable, Equatable {
+    let codec: String
+    let sampleRate: Int?
+    let channels: Int?
 }
 
 /// How the sender reaches the receiver. Reconnects re-dial from scratch, so
@@ -97,6 +107,26 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video")
+
+    // ── System-audio forwarding (opt-in) ────────────────────────────────────
+    // Captured on the same SCStream as a second output, converted to s16le on
+    // its own queue, and sent as high-bit-tagged frames on the video socket so
+    // audio and video share one total order. Only active when the user enabled
+    // it (`forwardAudio`) and the receiver advertised support in its hello.
+    private let audioQueue = DispatchQueue(label: "sender.audio")
+    private var audioConverter: AVAudioConverter?
+    private var audioSourceFormat: AVAudioFormat?
+    private let audioTargetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                                  sampleRate: 48_000, channels: 2,
+                                                  interleaved: true)
+    private var audioForwarding = false
+    private var audioSawBuffer = false
+    private var audioSentOnce = false
+    private var audioLoggedEmpty = false
+    private var audioFramesSent = 0
+    private var audioForwardRequested: Bool {
+        UserDefaults.standard.bool(forKey: "forwardAudio")
+    }
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
     // The dial target. Written on `queue` only (after init): the controller
@@ -389,6 +419,29 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self, self.connectionReady else { return }
             self.sendJSONFrame("{\"type\":\"\(WireMessage.hostAwake)\"}")
         }
+    }
+
+    /// Set the receiver's forwarded-audio playback gain (0…1). Public so the
+    /// controller can drive it from the menu without restarting the session.
+    func setAudioVolume(_ volume: Float) {
+        let clamped = min(max(volume, 0), 1)
+        queue.async { [weak self] in
+            guard let self, self.connectionReady else { return }
+            self.sendJSONFrame(self.audioVolumeJSON(clamped))
+        }
+    }
+
+    private func sendAudioVolume(on connection: NWConnection) {
+        sendJSONFrame(audioVolumeJSON(Self.storedAudioVolume()), on: connection)
+    }
+
+    private func audioVolumeJSON(_ volume: Float) -> String {
+        "{\"type\":\"\(WireMessage.audioVolume)\",\"v\":\(Double(volume))}"
+    }
+
+    static func storedAudioVolume() -> Float {
+        UserDefaults.standard.object(forKey: "forwardAudioVolume") == nil
+            ? 1 : Float(UserDefaults.standard.double(forKey: "forwardAudioVolume"))
     }
 
     // MARK: - Lifecycle
@@ -729,6 +782,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             || old.maxEncodeHigh != new.maxEncodeHigh
             || old.displayMaxFrameRate != new.displayMaxFrameRate
             || old.videoCaps != new.videoCaps
+            || old.audio != new.audio
         let desktopChanged = mode == .extend
             && (old.pixelsWide != new.pixelsWide || old.pixelsHigh != new.pixelsHigh)
         return receiverConstraintsChanged || desktopChanged
@@ -916,6 +970,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         config.queueDepth = 8
         config.showsCursor = !localCursor
 
+        // System audio rides the same stream as an optional second output, only
+        // when the user enabled it and the receiver advertised support.
+        audioForwarding = audioForwardRequested && info.audio != nil
+        Log.info("audio: requested=\(audioForwardRequested) receiverSupports=\(info.audio != nil) forwarding=\(audioForwarding)")
+        if audioForwarding {
+            config.capturesAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 2
+            config.excludesCurrentProcessAudio = true
+        }
+
         try Task.checkCancellation()
         guard !stopped else { throw CancellationError() }
         invalidateCapturePipeline(discardingLastFrame: true)
@@ -931,6 +996,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if audioForwarding {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        }
         self.stream = stream
         do {
             try await stream.startCapture()
@@ -1274,6 +1342,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             sendStreamConfiguration(selected, on: conn)
         }
         connectionReady = true
+        // A reconnecting receiver starts at its own default gain; resend the
+        // user's chosen level so the forwarded audio comes back at the same volume.
+        sendAudioVolume(on: conn)
         // Keep cached pixels: ScreenCaptureKit stays quiet on a static
         // display, and the watchdog needs them to force the reconnect IDR.
         cancelDropReplayTimer()
@@ -2250,9 +2321,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
-        guard stream === self.stream,
-              type == .screen,
-              CMSampleBufferIsValid(sampleBuffer),
+        guard stream === self.stream, CMSampleBufferIsValid(sampleBuffer) else { return }
+        if type == .audio {
+            handleAudioSampleBuffer(sampleBuffer)
+            return
+        }
+        guard type == .screen,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
 
@@ -2268,6 +2342,107 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         if shouldDropFrame(reason: "pending_sends") { return }   // TCP send queue full
 
         encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), generation: generation)
+    }
+
+    /// Convert a captured system-audio buffer to interleaved s16le and hand it to
+    /// the video queue to send. Runs on `audioQueue`.
+    private func handleAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        if !audioSawBuffer {
+            audioSawBuffer = true
+            Log.info("audio: first captured buffer (forwarding=\(audioForwarding))")
+        }
+        guard audioForwarding,
+              let target = audioTargetFormat,
+              let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription),
+              asbd.pointee.mSampleRate > 0
+        else { return }
+        guard let sourceFormat = AVAudioFormat(streamDescription: asbd) else { return }
+        if audioSourceFormat != sourceFormat {
+            audioConverter = AVAudioConverter(from: sourceFormat, to: target)
+            audioSourceFormat = sourceFormat
+            Log.info("audio: forward \(Int(sourceFormat.sampleRate))Hz x\(sourceFormat.channelCount) -> s16le 48k stereo")
+        }
+        guard let converter = audioConverter,
+              let input = makeInputBuffer(sampleBuffer, format: sourceFormat)
+        else { return }
+
+        let ratio = target.sampleRate / sourceFormat.sampleRate
+        let capacity = AVAudioFrameCount((Double(input.frameLength) * ratio).rounded(.up)) + 64
+        guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
+
+        var fed = false
+        var conversionError: NSError?
+        converter.convert(to: output, error: &conversionError) { _, status in
+            if fed {
+                status.pointee = .noDataNow
+                return nil
+            }
+            fed = true
+            status.pointee = .haveData
+            return input
+        }
+        guard conversionError == nil, output.frameLength > 0,
+              let samples = output.int16ChannelData?[0]
+        else {
+            if !audioLoggedEmpty {
+                audioLoggedEmpty = true
+                Log.info("audio: converter produced no output (error=\(conversionError?.localizedDescription ?? "none"), frames=\(output.frameLength))")
+            }
+            return
+        }
+        let pcm = Data(bytes: samples, count: Int(output.frameLength) * 2 * 2)  // stereo s16
+        queue.async { [weak self] in self?.sendAudioFrame(pcm) }
+    }
+
+    /// Wrap a CMSampleBuffer's PCM in an AVAudioPCMBuffer of its own format so
+    /// AVAudioConverter can read it. Copies per buffer, so it does not care
+    /// whether the source is interleaved or planar.
+    private func makeInputBuffer(_ sampleBuffer: CMSampleBuffer,
+                                 format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))
+        else { return nil }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        let channels = max(1, Int(format.channelCount))
+        let list = AudioBufferList.allocate(maximumBuffers: channels)
+        defer { free(list.unsafeMutablePointer) }
+        var blockBuffer: CMBlockBuffer?
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+                sampleBuffer,
+                bufferListSizeNeededOut: nil,
+                bufferListOut: list.unsafeMutablePointer,
+                bufferListSize: AudioBufferList.sizeInBytes(maximumBuffers: channels),
+                blockBufferAllocator: kCFAllocatorDefault,
+                blockBufferMemoryAllocator: kCFAllocatorDefault,
+                flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+                blockBufferOut: &blockBuffer) == noErr else { return nil }
+        let source = UnsafeMutableAudioBufferListPointer(list.unsafeMutablePointer)
+        let destination = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        for index in 0..<min(source.count, destination.count) {
+            guard let from = source[index].mData, let to = destination[index].mData else { return nil }
+            memcpy(to, from, min(Int(source[index].mDataByteSize), Int(destination[index].mDataByteSize)))
+        }
+        return buffer
+    }
+
+    /// Send one PCM frame on the video socket, tagged with the high bit so the
+    /// receiver routes it to audio instead of the Annex-B parser.
+    private func sendAudioFrame(_ pcm: Data) {
+        guard audioForwarding, connectionReady, let connection else { return }
+        if !audioSentOnce {
+            audioSentOnce = true
+            Log.info("audio: first frame sent (\(pcm.count) bytes)")
+        }
+        audioFramesSent += 1
+        if audioFramesSent % 100 == 0 {
+            Log.info("audio: sent \(audioFramesSent) frames")
+        }
+        var header = (UInt32(pcm.count) | 0x8000_0000).bigEndian
+        var frame = Data(bytes: &header, count: 4)
+        frame.append(pcm)
+        connection.send(content: frame, completion: .contentProcessed { _ in })
     }
 
     private func isPipelineBackedUp() -> Bool {
