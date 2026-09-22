@@ -372,7 +372,14 @@ port 5353 ever misbehaves.
 
 ---
 
-## 6. To file / update on GitHub (when `gh` is available)
+## 6. Filed on GitHub (2026-09-22)
+
+Draft PR #298 (`linux-plan`); status comment on #284; sender issue **#299**
+(supersedes #84); cross-references on #84 and #15. The drafts below are kept
+for the record. Still to do: the upstream GStreamer report (§6.4) and the doc
+updates (§6.5). Next-machine checklist: `linux/HANDOFF.md`.
+
+### Drafts as posted
 
 ### 6.1 Comment on #284
 

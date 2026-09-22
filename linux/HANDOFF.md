@@ -7,7 +7,7 @@ LAN reachability. The Intel box unlocks exactly the things the VM could not
 prove. Read `PLAN.md` for the full plan and decisions; this file is the
 short "what to do next" list.
 
-## 1. Where things stand (branch `linux-plan`, PR #298)
+## 1. Where things stand (branch `linux-plan`, PR #298; issues #284 receiver, #299 sender)
 
 | Piece | State | Verified how |
 |---|---|---|
