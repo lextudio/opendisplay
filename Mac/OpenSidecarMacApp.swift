@@ -193,6 +193,20 @@ final class SenderController: ObservableObject {
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
     }
+    // Capture frame rate. The receiver's ceiling and the H.264 level can lower
+    // it further; higher than the display's refresh is a no-op.
+    @Published var frameRate = UserDefaults.standard.object(forKey: "frameRate") == nil
+        ? H264StreamConfiguration.defaultFramesPerSecond
+        : UserDefaults.standard.integer(forKey: "frameRate") {
+        didSet { UserDefaults.standard.set(frameRate, forKey: "frameRate") }
+    }
+    static let frameRateOptions = [30, 60, 90, 120]
+    // On WiFi, cap the top preset so a marginal link degrades to a smaller,
+    // smoother stream instead of stuttering (#287). The cable keeps the choice.
+    @Published var adaptiveQuality = UserDefaults.standard.object(forKey: "adaptiveQuality") == nil
+        ? true : UserDefaults.standard.bool(forKey: "adaptiveQuality") {
+        didSet { UserDefaults.standard.set(adaptiveQuality, forKey: "adaptiveQuality") }
+    }
     // Forward this Mac's system audio to the receiver. Opt-in (issue #12/#182);
     // only takes effect when the receiver advertised audio support.
     @Published var forwardAudio = UserDefaults.standard.bool(forKey: "forwardAudio") {
@@ -651,10 +665,18 @@ final class SenderController: ObservableObject {
         }
 
         let name = label(for: target)
+        // WiFi cap (#287): a jittery link wants fewer pixels, not more retries.
+        let senderQuality: StreamQuality
+        if adaptiveQuality, case .tcp = transport {
+            senderQuality = quality == .best ? .balanced : quality
+        } else {
+            senderQuality = quality
+        }
         let sender = MacSender(transport: transport, name: name, mode: mode,
-                               quality: quality, displaySerial: Self.displaySerial(for: id),
+                               quality: senderQuality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
-                               awaitingWake: awaitingWake)
+                               awaitingWake: awaitingWake,
+                               frameRate: frameRate)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
@@ -1039,7 +1061,21 @@ struct ContentView: View {
                         }
                     }
                     .onChange(of: controller.quality) { controller.restartAll() }
+                    Toggle("Cap quality on WiFi", isOn: $controller.adaptiveQuality)
+                        .onChange(of: controller.adaptiveQuality) { controller.restartAll() }
                     Text(controller.quality.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Frame rate", selection: $controller.frameRate) {
+                        ForEach(SenderController.frameRateOptions, id: \.self) { rate in
+                            Text("\(rate) fps").tag(rate)
+                        }
+                    }
+                    .onChange(of: controller.frameRate) { controller.restartAll() }
+                    Text("Capped by the display's refresh and the receiver. Lower it on WiFi or heavy encodes for smoother motion.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

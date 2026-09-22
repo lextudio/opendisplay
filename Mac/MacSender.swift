@@ -135,6 +135,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let endpointName: String
     private let mode: CaptureMode
     private let quality: StreamQuality
+    // Requested capture frame rate; the receiver's ceiling and the H.264 level
+    // can lower it further (see H264StreamConfiguration.make).
+    private let frameRate: Int
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private let displaySerial: UInt32
@@ -358,11 +361,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(transport: SenderTransport, name: String, mode: CaptureMode,
          quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
-         identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
+         identityOffset: UInt32 = 0, awaitingWake: Bool = false,
+         frameRate: Int = H264StreamConfiguration.defaultFramesPerSecond) {
         self.transport = transport
         self.endpointName = name
         self.mode = mode
         self.quality = quality
+        self.frameRate = frameRate
         self.displaySerial = displaySerial
         self.baseIdentityOffset = identityOffset
         self.awaitingWake = awaitingWake
@@ -945,7 +950,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             quality: quality,
             legacyCeiling: legacyCeiling,
             receiverCapabilities: info.videoCaps,
-            displayMaxFrameRate: info.displayMaxFrameRate)
+            displayMaxFrameRate: info.displayMaxFrameRate,
+            requestedFramesPerSecond: frameRate)
         let pixelsWide = selected.encodedSize.width
         let pixelsHigh = selected.encodedSize.height
         let sourceDescription = "\(sourcePixelsWide)x\(sourcePixelsHigh)"
