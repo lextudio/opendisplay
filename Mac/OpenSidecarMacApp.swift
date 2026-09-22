@@ -193,11 +193,42 @@ final class SenderController: ObservableObject {
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
     }
+    // Forward this Mac's system audio to the receiver. Opt-in (issue #12/#182);
+    // only takes effect when the receiver advertised audio support.
+    @Published var forwardAudio = UserDefaults.standard.bool(forKey: "forwardAudio") {
+        didSet { UserDefaults.standard.set(forwardAudio, forKey: "forwardAudio") }
+    }
+    // Playback gain for forwarded audio, applied as the receiver node's volume.
+    // Deliberately NOT @Published: the slider drives it continuously, and
+    // republishing the controller on every drag tick re-renders the whole panel
+    // (the Mode picker visibly jitters). The view holds a local draft instead.
+    private(set) var forwardAudioVolume: Double = UserDefaults.standard.object(forKey: "forwardAudioVolume") == nil
+        ? 1.0 : UserDefaults.standard.double(forKey: "forwardAudioVolume")
+
+    func setForwardAudioVolume(_ value: Double) {
+        let clamped = min(max(value, 0), 1)
+        forwardAudioVolume = clamped
+        UserDefaults.standard.set(clamped, forKey: "forwardAudioVolume")
+        let level = Float(clamped)
+        sessions.forEach { $0.sender.setAudioVolume(level) }
+    }
+
+    /// Slider -> system output volume, so the volume keys continue from the
+    /// dragged level instead of jumping back to the device's own value.
+    func setSystemAudioVolume(_ value: Double) {
+        outputVolume.setVolume(value)
+    }
 
     var running: Bool { !sessions.isEmpty }
 
     private var browser: NWBrowser?
     private var usbWatcher: UsbmuxDeviceWatcher?
+    // The Mac's output volume (volume keys) bridged to the forwarded-audio gain.
+    // Lives here, not in the panel row, so it keeps working with the panel shut;
+    // changes reach the row through `audioVolumeChanges` instead of republishing
+    // the controller (which would make the segmented Mode picker jitter).
+    let audioVolumeChanges = PassthroughSubject<Double, Never>()
+    private let outputVolume = OutputVolumeMonitor()
     // Screen-unlock / system-wake observers that re-arm attached devices — see
     // startObservingUnlockAndWake. Kept so they are not deallocated.
     private var wakeObservers: [NSObjectProtocol] = []
@@ -257,6 +288,14 @@ final class SenderController: ObservableObject {
             self.autoConnect()
         }
         startObservingUnlockAndWake()
+        // Bridge the system output volume (Mac volume keys) into the forwarded
+        // gain, and keep the panel in sync through the subject.
+        outputVolume.onChange = { [weak self] value in
+            guard let self else { return }
+            self.setForwardAudioVolume(value)
+            self.audioVolumeChanges.send(value)
+        }
+        outputVolume.start()
     }
 
     private func startBrowsing() {
@@ -884,6 +923,39 @@ final class PermissionMonitor: ObservableObject {
     }
 }
 
+/// Isolated so dragging the volume slider re-renders only this row. If the
+/// slider lives in `ContentView.body`, every tick re-lays-out the whole `Form`
+/// and the segmented Mode picker visibly jitters.
+private struct AudioSettingsRow: View {
+    @ObservedObject var controller: SenderController
+    @State private var volume: Double = 1
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Forward system audio", isOn: $controller.forwardAudio)
+                .onChange(of: controller.forwardAudio) { controller.restartAll() }
+            HStack(spacing: 6) {
+                Image(systemName: "speaker.fill")
+                Slider(value: $volume, in: 0...1)
+                    .onChange(of: volume) { value in
+                        controller.setForwardAudioVolume(value)
+                        // Write back so the volume keys continue from here.
+                        if controller.forwardAudio { controller.setSystemAudioVolume(value) }
+                    }
+                Image(systemName: "speaker.wave.3.fill")
+            }
+            .disabled(!controller.forwardAudio)
+            Text("Play this Mac's audio on the receiver's speaker, at this level — the Mac volume keys work too. The iPad's own volume still applies on top.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .onAppear { volume = controller.forwardAudioVolume }
+        // Mac volume keys change the device volume; follow it without
+        // republishing the controller (only this row re-renders).
+        .onReceive(controller.audioVolumeChanges) { volume = $0 }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var controller: SenderController
     @StateObject private var permissions = PermissionMonitor()
@@ -971,6 +1043,8 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+
+                AudioSettingsRow(controller: controller)
 
                 VStack(alignment: .leading, spacing: 4) {
                     Picker("Show app in", selection: $controller.presentation) {
