@@ -164,18 +164,29 @@ no accounts, no analytics. Full details — including what the apps store
 locally and the current WiFi-encryption caveat — on the
 [privacy page](https://peetzweg.github.io/opendisplay/privacy.html).
 
+**Why is protected video (Netflix, Apple TV+, HBO) black?** Not a bug, and not
+something we can fix: macOS refuses to hand DRM/HDCP-protected frames to any
+screen-capture API, so those regions arrive black (audio usually drops too).
+Every capture-based tool behaves this way — QuickTime, OBS, Zoom sharing — and
+Apple's own Sidecar blacks them out as well, because its link is not an
+HDCP-protected output. Play protected content on the device itself, or on a
+display with a real HDCP path.
+
 **What's the license? Can I fork it or use it commercially?**
 [GPL-3.0](LICENSE). Use, study, and adapt it freely — commercially too. If
 you distribute a modified version it must stay open source under the same
 license with the original attribution intact, so improvements flow back
 instead of into closed forks. (Releases up to v0.4.x were MIT-licensed and
-remain available under those terms.)
+remain under those terms.)
 
 **Will it break on a macOS update?** Possibly — `CGVirtualDisplay` is
 private API. The same risk applies to every virtual-display product.
 The capture/streaming pipeline itself uses only public APIs.
 
-**Audio?** Out of scope for now.
+**Audio?** System audio can be forwarded to the receiver's speaker (opt-in in
+the Mac app; the receiver must support it). The Mac's own output is not
+muted, so route it through a virtual device like BlackHole if you want the
+iPad to be the only speaker.
 
 ## Compatible apps
 
