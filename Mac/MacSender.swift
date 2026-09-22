@@ -558,7 +558,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                                           onOriginChange: { origin, currentSize in
                                               DisplayArrangement.save(origin: origin, size: currentSize,
                                                                       device: arrangementKey)
-                                          })
+                                          },
+                                          deviceKey: arrangementKey)
                 }
                 if stopped { throw CancellationError() }
                 if created != nil { break }
