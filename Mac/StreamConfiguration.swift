@@ -249,3 +249,21 @@ struct FrameRateLimiter {
         return true
     }
 }
+
+/// Which codec the sender should use. HEVC compresses ~30–50% better than
+/// H.264 at the same quality; H.264 is the universal fallback.
+enum VideoCodecPreference: String, CaseIterable {
+    case auto, h264, hevc
+
+    var label: String {
+        switch self {
+        case .auto: return "Auto"
+        case .h264: return "H.264"
+        case .hevc: return "HEVC"
+        }
+    }
+}
+
+enum VideoCodec: String {
+    case h264, hevc
+}

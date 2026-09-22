@@ -115,6 +115,10 @@ final class StreamReceiver: ObservableObject {
     private let queue = DispatchQueue(label: "receiver.video")
     private var buffer = Data()
     private var formatDesc: CMVideoFormatDescription?
+    // The chosen video codec (from streamConfig). H.264 uses sps/pps; HEVC adds
+    // a VPS. Both are length-prefixed the same way on the wire.
+    private var videoCodec = "h264"
+    private var vps: Data?
     private var sps: Data?
     private var pps: Data?
 
@@ -829,14 +833,21 @@ final class StreamReceiver: ObservableObject {
             // operating point so future codecs never have to be guessed from
             // the first binary frame.
             let codec = (obj["codec"] as? String)?.lowercased() ?? "h264"
-            guard codec == "h264" else {
+            guard codec == "h264" || codec == "hevc" else {
                 Log.info("unsupported stream codec selected: \(codec)")
                 return
+            }
+            if codec != videoCodec {
+                videoCodec = codec
+                vps = nil
+                sps = nil
+                pps = nil
+                formatDesc = nil
             }
             let width = obj["width"] as? Int ?? 0
             let height = obj["height"] as? Int ?? 0
             let fps = obj["framesPerSecond"] as? Int ?? 0
-            Log.info("stream configuration: H.264 \(width)x\(height) @\(fps)fps")
+            Log.info("stream configuration: \(codec.uppercased()) \(width)x\(height) @\(fps)fps")
         case WireMessage.updateRequired:
             // The Mac refuses this pairing until we update from the App Store.
             let message = obj["message"] as? String
@@ -880,6 +891,7 @@ final class StreamReceiver: ObservableObject {
     private func resetStreamState() {
         buffer.removeAll(keepingCapacity: true)
         formatDesc = nil
+        vps = nil
         sps = nil
         pps = nil
         lastFrameAt = nil
@@ -919,7 +931,19 @@ final class StreamReceiver: ObservableObject {
             h264["maxHeight"] = maxEncodeHigh
         }
         if let maxPixelsPerSecond { h264["maxPixelsPerSecond"] = maxPixelsPerSecond }
-        hello["videoCaps"] = [h264]
+        // Offer HEVC as an additional alternative when the hardware decodes it;
+        // the sender only uses it if its user picked it and the raster fits.
+        var videoCaps: [[String: Any]] = [h264]
+        if VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) {
+            var hevc: [String: Any] = ["codec": "hevc", "maxFrameRate": 60]
+            if let maxEncodeWide, let maxEncodeHigh {
+                hevc["maxWidth"] = maxEncodeWide
+                hevc["maxHeight"] = maxEncodeHigh
+            }
+            if let maxPixelsPerSecond { hevc["maxPixelsPerSecond"] = maxPixelsPerSecond }
+            videoCaps.append(hevc)
+        }
+        hello["videoCaps"] = videoCaps
         // Additive: system-audio forwarding. The host only sends audio when its
         // user opts in AND this field is present, so old hosts/receivers are
         // unaffected. Fixed format keeps the MVP simple; codec is additive.
@@ -1142,59 +1166,97 @@ final class StreamReceiver: ObservableObject {
         }
 
         var vclNALUs: [Data] = []
+        let hevc = videoCodec == "hevc"
         for nalu in nalus {
             guard let first = nalu.first else { continue }
-            switch first & 0x1F {
-            case 7:                                  // SPS (stream may change
-                if sps != nalu {                     //  size on rotation)
-                    sps = nalu
-                    formatDesc = nil
+            if hevc {
+                // HEVC NAL header is two bytes: type = (first >> 1) & 0x3F.
+                switch (first >> 1) & 0x3F {
+                case 32:                                 // VPS
+                    if vps != nalu { vps = nalu; formatDesc = nil }
+                case 33:                                 // SPS
+                    if sps != nalu { sps = nalu; formatDesc = nil }
+                case 34:                                 // PPS
+                    if pps != nalu { pps = nalu; formatDesc = nil }
+                case 39, 40: break                       // SEI — skip
+                default: vclNALUs.append(nalu)           // slice data
                 }
-            case 8:                                  // PPS
-                if pps != nalu {
-                    pps = nalu
-                    formatDesc = nil
+            } else {
+                switch first & 0x1F {
+                case 7:                                  // SPS (stream may change
+                    if sps != nalu {                     //  size on rotation)
+                        sps = nalu
+                        formatDesc = nil
+                    }
+                case 8:                                  // PPS
+                    if pps != nalu {
+                        pps = nalu
+                        formatDesc = nil
+                    }
+                case 6: break                            // SEI — skip
+                default: vclNALUs.append(nalu)           // slice data
                 }
-            case 6: break                            // SEI — skip
-            default: vclNALUs.append(nalu)           // slice data
             }
         }
-        if formatDesc == nil, let sps, let pps {
+        if formatDesc == nil, let sps, let pps, !hevc || vps != nil {
             displayLayer.flushAndRemoveImage()   // drop the previous format's last image
-            buildFormatDescription(sps: sps, pps: pps)
+            buildFormatDescription()
         }
         guard !vclNALUs.isEmpty else { return }
         // All slices of one wire frame go into ONE sample buffer.
         enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
     }
 
-    private func buildFormatDescription(sps: Data, pps: Data) {
-        sps.withUnsafeBytes { spsBuf in
-            pps.withUnsafeBytes { ppsBuf in
-                let ptrs: [UnsafePointer<UInt8>] = [
-                    spsBuf.bindMemory(to: UInt8.self).baseAddress!,
-                    ppsBuf.bindMemory(to: UInt8.self).baseAddress!
-                ]
-                let sizes = [sps.count, pps.count]
-                let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault,
-                    parameterSetCount: 2,
-                    parameterSetPointers: ptrs,
-                    parameterSetSizes: sizes,
-                    nalUnitHeaderLength: 4,
-                    formatDescriptionOut: &formatDesc
-                )
-                if status == noErr, let formatDesc {
-                    let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
-                    Log.info("format description built: \(dims.width)x\(dims.height)")
-                    DispatchQueue.main.async {
-                        self.videoSize = CGSize(width: Int(dims.width), height: Int(dims.height))
+    private func buildFormatDescription() {
+        let status: OSStatus
+        if videoCodec == "hevc", let vps, let sps, let pps {
+            status = vps.withUnsafeBytes { vpsBuf in
+                sps.withUnsafeBytes { spsBuf in
+                    pps.withUnsafeBytes { ppsBuf in
+                        let ptrs: [UnsafePointer<UInt8>] = [
+                            vpsBuf.bindMemory(to: UInt8.self).baseAddress!,
+                            spsBuf.bindMemory(to: UInt8.self).baseAddress!,
+                            ppsBuf.bindMemory(to: UInt8.self).baseAddress!,
+                        ]
+                        return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                            allocator: kCFAllocatorDefault,
+                            parameterSetCount: 3,
+                            parameterSetPointers: ptrs,
+                            parameterSetSizes: [vps.count, sps.count, pps.count],
+                            nalUnitHeaderLength: 4,
+                            extensions: nil,
+                            formatDescriptionOut: &formatDesc)
                     }
-                    setStatus("Receiving \(dims.width)×\(dims.height)")
-                } else {
-                    Log.info("format description FAILED: \(status)")
                 }
             }
+        } else if let sps, let pps {
+            status = sps.withUnsafeBytes { spsBuf in
+                pps.withUnsafeBytes { ppsBuf in
+                    let ptrs: [UnsafePointer<UInt8>] = [
+                        spsBuf.bindMemory(to: UInt8.self).baseAddress!,
+                        ppsBuf.bindMemory(to: UInt8.self).baseAddress!,
+                    ]
+                    return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                        allocator: kCFAllocatorDefault,
+                        parameterSetCount: 2,
+                        parameterSetPointers: ptrs,
+                        parameterSetSizes: [sps.count, pps.count],
+                        nalUnitHeaderLength: 4,
+                        formatDescriptionOut: &formatDesc)
+                }
+            }
+        } else {
+            return
+        }
+        if status == noErr, let formatDesc {
+            let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
+            Log.info("format description built: \(dims.width)x\(dims.height) (\(videoCodec))")
+            DispatchQueue.main.async {
+                self.videoSize = CGSize(width: Int(dims.width), height: Int(dims.height))
+            }
+            setStatus("Receiving \(dims.width)×\(dims.height)")
+        } else {
+            Log.info("format description FAILED: \(status)")
         }
     }
 

@@ -201,6 +201,12 @@ final class SenderController: ObservableObject {
         didSet { UserDefaults.standard.set(frameRate, forKey: "frameRate") }
     }
     static let frameRateOptions = [30, 60, 90, 120]
+    // Preferred video codec. Auto uses HEVC when the receiver supports it
+    // (better compression at the same quality), otherwise H.264.
+    @Published var videoCodec = VideoCodecPreference(
+        rawValue: UserDefaults.standard.string(forKey: "videoCodec") ?? "") ?? .auto {
+        didSet { UserDefaults.standard.set(videoCodec.rawValue, forKey: "videoCodec") }
+    }
     // On WiFi, cap the top preset so a marginal link degrades to a smaller,
     // smoother stream instead of stuttering (#287). The cable keeps the choice.
     @Published var adaptiveQuality = UserDefaults.standard.object(forKey: "adaptiveQuality") == nil
@@ -676,7 +682,8 @@ final class SenderController: ObservableObject {
                                quality: senderQuality, displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake,
-                               frameRate: frameRate)
+                               frameRate: frameRate,
+                               codecPreference: videoCodec)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
@@ -1076,6 +1083,18 @@ struct ContentView: View {
                     }
                     .onChange(of: controller.frameRate) { controller.restartAll() }
                     Text("Capped by the display's refresh and the receiver. Lower it on WiFi or heavy encodes for smoother motion.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Codec", selection: $controller.videoCodec) {
+                        ForEach(VideoCodecPreference.allCases, id: \.self) { codec in
+                            Text(codec.label).tag(codec)
+                        }
+                    }
+                    .onChange(of: controller.videoCodec) { controller.restartAll() }
+                    Text("Auto uses HEVC where the receiver supports it for better quality at the same bitrate; H.264 is the universal fallback.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
