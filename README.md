@@ -186,7 +186,8 @@ The capture/streaming pipeline itself uses only public APIs.
 **Audio?** System audio can be forwarded to the receiver's speaker (opt-in in
 the Mac app; the receiver must support it). The Mac's own output is not
 muted, so route it through a virtual device like BlackHole if you want the
-iPad to be the only speaker.
+iPad to be the only speaker. The Mac's volume and mute keys drive the
+forwarded playback gain, so muting the Mac silences the receiver too.
 
 ## Compatible apps
 
