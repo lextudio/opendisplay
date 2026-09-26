@@ -90,11 +90,25 @@ final class StreamReceiver: ObservableObject {
     private var cursorListenerReady = false
     private var cursorConnection: NWConnection?
     private var cursorPortAnnounced = false
-    // Newcomer connections still proving themselves against a live session
-    // (see the listener). Tracked so stop() and adoption can cancel them —
-    // an untracked silent socket would sit parked forever and could even
-    // adopt into a receiver that was stopped in the meantime.
-    private var pendingConnections: [NWConnection] = []
+    // ── Multi-Mac roster + playback token ────────────────────────────────────
+    // Every Mac that completes the handshake is registered here; only the one
+    // holding the token (`activeMacId`) may send audio/video. The token outlives
+    // a disconnect: a holder that drops off keeps it reserved until it returns,
+    // and it only moves when the holder transfers it or the user forces it from
+    // this receiver's UI.
+    private struct MacPeer {
+        let macId: String
+        var name: String
+        var connection: NWConnection
+    }
+    private var macPeers: [String: MacPeer] = [:]
+    private var activeMacId: String?
+    // Connection -> Mac id, independent of the current `macPeers` entry so a
+    // Bonjour IPv6/IPv4 twin that replaced the map entry can still be resolved.
+    private var connMacIds: [ObjectIdentifier: String] = [:]
+    private func macId(for conn: NWConnection) -> String? {
+        connMacIds[ObjectIdentifier(conn)]
+    }
     // What the last hello advertised, to notice a cable appearing
     // mid-session: plugging one creates new interfaces, and a sender can
     // only probe addresses it has been told about.
@@ -113,7 +127,10 @@ final class StreamReceiver: ObservableObject {
     private var cursorLostThisWindow = 0
     private var cursorPort: UInt16 { port &+ 1 }
     private let queue = DispatchQueue(label: "receiver.video")
-    private var buffer = Data()
+    // One deframing buffer per connection: waiting Macs only send control JSON,
+    // the token holder sends the stream, and both ride length-prefixed frames on
+    // the same socket type.
+    private var buffers: [ObjectIdentifier: Data] = [:]
     private var formatDesc: CMVideoFormatDescription?
     // The chosen video codec (from streamConfig). H.264 uses sps/pps; HEVC adds
     // a VPS. Both are length-prefixed the same way on the wire.
@@ -368,8 +385,10 @@ final class StreamReceiver: ObservableObject {
             self.pingTimer?.cancel(); self.pingTimer = nil
             self.watchdogTimer?.cancel(); self.watchdogTimer = nil
             self.addrWatchTimer?.cancel(); self.addrWatchTimer = nil
-            self.pendingConnections.forEach { $0.cancel() }
-            self.pendingConnections.removeAll()
+            self.macPeers.values.forEach { $0.connection.cancel() }
+            self.macPeers.removeAll()
+            self.activeMacId = nil
+            self.buffers.removeAll()
         }
         closeSession(announcing: WireMessage.closing, status: "Stopped",
                      completion: completion)
@@ -437,6 +456,14 @@ final class StreamReceiver: ObservableObject {
                 finished = true
                 self.connection?.cancel()
                 self.connection = nil
+                self.macPeers.values.forEach { $0.connection.cancel() }
+                self.macPeers.removeAll()
+                self.activeMacId = nil
+                self.buffers.removeAll()
+                DispatchQueue.main.async {
+                    self.rosterSnapshot = []
+                    self.onRosterChanged?()
+                }
                 self.listener?.cancel()
                 self.listener = nil
                 self.listenerHealthy = false
@@ -600,52 +627,25 @@ final class StreamReceiver: ObservableObject {
             let peer = String(describing: conn.endpoint)
             self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
                               || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
-            // A Bonjour dial races IPv6 and IPv4 and both handshakes can
-            // complete; the sender cancels its loser within milliseconds.
-            // Adopting every newcomer at once evicted the winner for a
-            // connection that was already dying (seen in the field as a
-            // reset-by-peer storm). With a connection in hand, a newcomer
-            // has to stay alive for a moment before it replaces it.
-            // A closed socket still reads as .ready until a receive hits
-            // EOF, so the proof is bytes: greet the newcomer and adopt it
-            // the moment it streams something back; a socket that closes
-            // or errors first is discarded and the session stays put.
-            if let current = self.connection, current.state != .cancelled,
-               !Self.isFailed(current.state) {
-                self.pendingConnections.append(conn)
-                conn.stateUpdateHandler = { [weak self] state in
-                    guard let self, case .ready = state else { return }
-                    // This socket has not won the session yet. Keep cursor UDP
-                    // out of its provisional hello: otherwise its flow could
-                    // arrive before adopt(), then be indistinguishable from
-                    // the old session's flow that adopt must retire.
-                    self.sendHello(on: conn, includeCursorPort: false)
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
-                        [weak self] data, _, isComplete, error in
-                        guard let self else { return }
-                        // Only a still-tracked candidate may adopt: adoption
-                        // of a rival and stop() both clear the list, so a
-                        // late callback can't evict a session or resurrect a
-                        // stopped receiver.
-                        guard self.pendingConnections.contains(where: { $0 === conn }) else {
-                            conn.cancel()
-                            return
-                        }
-                        self.pendingConnections.removeAll { $0 === conn }
-                        if let data, !data.isEmpty {
-                            self.adopt(conn, greeted: true, initialData: data)
-                        } else {
-                            Log.info("ignored a twin connection that closed at once"
-                                     + (error.map { " (\($0))" } ?? ""))
-                            conn.cancel()
-                        }
-                        _ = isComplete
-                    }
+            // Every Mac is accepted and greeted. Whether it may stream is decided
+            // later by the playback token: it identifies itself with a welcome,
+            // and registerMac grants the token to the first Mac or leaves the
+            // others waiting. A socket that never sends a welcome is dropped by
+            // the stalled-peer watchdog.
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.lastDataReceived = Date()
+                    self.sendHello(on: conn)
+                    self.receive(on: conn)
+                case .failed, .cancelled:
+                    self.handlePeerGone(conn)
+                default:
+                    break
                 }
-                conn.start(queue: self.queue)
-            } else {
-                self.adopt(conn)
             }
+            conn.start(queue: self.queue)
         }
         listener?.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
@@ -672,61 +672,163 @@ final class StreamReceiver: ObservableObject {
     /// without the cursor port while it proved itself (see the listener), with
     /// the bytes it sent back in `initialData`. Once adopted, the full hello
     /// opens a cursor flow that unambiguously belongs to this session.
-    private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
-        if greeted { Log.info("newcomer proved itself — adopting it as the session") }
-        connection?.cancel()
+    // MARK: - Multi-Mac roster + playback token
+
+    /// Main-thread snapshot for the receiver's own UI (published so SwiftUI
+    /// re-renders when the roster or holder changes).
+    @Published private(set) var rosterSnapshot: [PeerInfo] = []
+    /// Called on the main thread whenever the roster or the token holder changes.
+    var onRosterChanged: (() -> Void)?
+
+    /// Register a Mac that completed the handshake. The first Mac to register
+    /// takes the token; later ones join the roster and wait. A twin socket (the
+    /// Bonjour IPv6/IPv4 race) re-registers the same id and replaces the earlier
+    /// connection.
+    private func registerMac(macId: String, name: String, on conn: NWConnection) {
+        // Idempotent: a repeated welcome on an already-current session must not
+        // re-promote or re-broadcast (that would ping-pong with the sender's own
+        // hello handling).
+        if macPeers[macId]?.connection === conn, connection === conn, activeMacId == macId {
+            return
+        }
+        connMacIds[ObjectIdentifier(conn)] = macId
+        if let existing = macPeers[macId], existing.connection !== conn {
+            // The Bonjour dial races IPv6 and IPv4, so the same Mac can arrive
+            // twice. Do NOT cancel the earlier socket: the sender may be using it
+            // as its live one, and cancelling it here is what made a streaming
+            // Mac invisible. Keep both resolvable; the one that actually carries
+            // the stream is promoted in drainFrames.
+            Log.info("twin connection for \(macId.prefix(8)) — keeping both sockets")
+        }
+        macPeers[macId] = MacPeer(macId: macId, name: name, connection: conn)
+        if activeMacId == nil {
+            activeMacId = macId
+        }
+        Log.info("mac registered: \(name) [\(macId.prefix(8))] holder=\(activeMacId == macId)")
+        if activeMacId == macId {
+            promoteToHolder(conn)
+        }
+        sendTokenState(to: conn)
+        broadcastRoster()
+    }
+
+    /// Point the streaming session at `conn` and reset decoder state, so a newly
+    /// promoted Mac starts from a clean slate — each Mac's session must not
+    /// inherit the previous one's format, cursor or forwarded audio.
+    private func promoteToHolder(_ conn: NWConnection) {
         connection = conn
-        // The race is decided: rival candidates die here.
-        for pending in pendingConnections where pending !== conn { pending.cancel() }
-        pendingConnections.removeAll()
-        // UDP cursor flows are scoped to the TCP session that negotiated
-        // them. Retire the old flow before rewinding the sequence floor so an
-        // in-flight datagram from the previous sender cannot establish a high
-        // floor on this fresh session. The listener remains up for the new
-        // sender to open its own flow after hello.
+        guard conn.state == .ready else { return }
+        // Cursor UDP flows are scoped to the TCP session that negotiated them.
         cursorConnection?.cancel()
         cursorConnection = nil
         resetStreamState()
-        lastCursorSeq = 0   // the sender restarts its cursor sequence per session
+        lastCursorSeq = 0
         cursorPortAnnounced = false
-        // Hide the previous sender's cursor: replayed into a fresh video view
-        // it would ghost over a new sender that never sends one (mirror mode
-        // hides no local cursor and streams no sprite).
         DispatchQueue.main.async {
             self.cursorState = (0.5, 0.5, false)
             self.cursorSprite = nil
             self.onCursor?(0.5, 0.5, false)
         }
-        let onReady: () -> Void = { [weak self] in
-            guard let self else { return }
-            self.lastDataReceived = Date()
-            self.setConnected(true)
-            self.sendHello(on: conn)
-        }
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self, conn === self.connection else { return }   // replaced: stay quiet
-            switch state {
-            case .ready: onReady()
-            case .failed, .cancelled: self.setConnected(false)
-            default: break
-            }
-        }
-        if conn.state == .ready {
-            onReady()   // already up: the handler will not fire again
-        } else {
-            conn.start(queue: queue)
-        }
-        if let initialData, !initialData.isEmpty {
-            bytesThisWindow += initialData.count
-            buffer.append(initialData)
-            drainFrames()
-        }
-        receive(on: conn)
+        lastDataReceived = Date()
+        setConnected(true)
+        // The socket was already greeted on connect, so do NOT send another hello
+        // here: the sender answers a hello with a welcome, which would come back
+        // through registerMac and re-promote this same connection forever.
     }
 
-    private static func isFailed(_ state: NWConnection.State) -> Bool {
-        if case .failed = state { return true }
-        return false
+    /// A connection went away. Its Mac leaves the roster, but if it held the
+    /// token the token stays reserved for that id — the holder keeps it until it
+    /// reconnects, and only the holder (or this receiver's UI) may move it.
+    private func handlePeerGone(_ conn: NWConnection) {
+        guard let macId = macId(for: conn) else { return }
+        connMacIds[ObjectIdentifier(conn)] = nil
+        guard macPeers[macId]?.connection === conn else { return }   // a twin replaced it
+        macPeers.removeValue(forKey: macId)
+        Log.info("mac left: \(macId.prefix(8)) (was holder=\(activeMacId == macId))")
+        if conn === connection {
+            connection = nil
+            resetStreamState()
+            setConnected(false)
+        }
+        buffers[ObjectIdentifier(conn)] = nil
+        broadcastRoster()
+    }
+
+    /// Move the token. `nil` releases it entirely (no Mac streams until one is
+    /// granted). Only the holder and this receiver's UI call this.
+    private func setHolder(_ macId: String?) {
+        guard macId != activeMacId || (macId != nil && connection == nil) else { return }
+        activeMacId = macId
+        if let macId, let peer = macPeers[macId] {
+            promoteToHolder(peer.connection)
+            sendTokenState(to: peer.connection)
+        } else {
+            connection = nil
+            resetStreamState()
+            setConnected(false)
+        }
+        broadcastToken()
+        broadcastRoster()
+    }
+
+    /// Force the token onto a connected Mac, from this receiver's own UI.
+    func forceGrantToken(to macId: String) {
+        queue.async { [weak self] in
+            guard let self, self.macPeers[macId] != nil else { return }
+            Log.info("force-granting token to \(macId.prefix(8))")
+            self.setHolder(macId)
+        }
+    }
+
+    private func sendTokenState(to conn: NWConnection) {
+        sendControl(["type": WireMessage.token, "activeId": activeMacId ?? ""], on: conn)
+    }
+
+    private func broadcastToken() {
+        let message: [String: Any] = ["type": WireMessage.token, "activeId": activeMacId ?? ""]
+        for peer in macPeers.values {
+            sendControl(message, on: peer.connection)
+        }
+    }
+
+    private func broadcastRoster() {
+        let peers = macPeers.values.map {
+            PeerInfo(id: $0.macId, name: $0.name, active: $0.macId == activeMacId)
+        }
+        let message: [String: Any] = [
+            "type": WireMessage.roster,
+            "activeId": activeMacId ?? "",
+            "peers": peers.map { ["id": $0.id, "name": $0.name, "active": $0.active] },
+        ]
+        for peer in macPeers.values {
+            sendControl(message, on: peer.connection)
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.rosterSnapshot = peers
+            self?.onRosterChanged?()
+        }
+    }
+
+    /// Token control from a Mac: only the holder's `release`/`grant` take effect.
+    private func handleTokenMessage(_ obj: [String: Any], on conn: NWConnection) {
+        guard let senderId = macId(for: conn) else { return }
+        switch (obj["action"] as? String)?.lowercased() ?? "" {
+        case "release":
+            guard senderId == activeMacId else { return }
+            if let to = obj["to"] as? String, macPeers[to] != nil {
+                setHolder(to)
+            } else {
+                setHolder(nil)
+            }
+        case "grant":
+            guard senderId == activeMacId,
+                  let to = obj["to"] as? String, macPeers[to] != nil else { return }
+            setHolder(to)
+        case "request":
+            break   // advisory: the receiver never auto-transfers
+        default:
+            break
+        }
     }
 
     // MARK: - Liveness (ping + watchdog)
@@ -737,8 +839,17 @@ final class StreamReceiver: ObservableObject {
         let ping = DispatchSource.makeTimerSource(queue: queue)
         ping.schedule(deadline: .now() + 2.0, repeating: 2.0)
         ping.setEventHandler { [weak self] in
-            guard let self, self.connection?.state == .ready else { return }
-            self.sendControl(["type": "ping", "t": self.nowMs])
+            guard let self else { return }
+            // Ping EVERY registered Mac, not just the token holder: a waiting Mac
+            // has no stream, so without a beat its own watchdog would reconnect
+            // every few seconds and flood us with short-lived sockets.
+            let message: [String: Any] = ["type": "ping", "t": self.nowMs]
+            for peer in self.macPeers.values where peer.connection.state == .ready {
+                self.sendControl(message, on: peer.connection)
+            }
+            if self.macPeers.isEmpty, self.connection?.state == .ready {
+                self.sendControl(message)
+            }
         }
         ping.resume()
         pingTimer = ping
@@ -767,16 +878,14 @@ final class StreamReceiver: ObservableObject {
             guard let self, let conn = self.connection, conn.state == .ready,
                   Date().timeIntervalSince(self.lastDataReceived) > 5 else { return }
             Log.info("watchdog: nothing from the Mac for >5s — dropping connection")
-            conn.cancel()
-            self.connection = nil
-            self.setConnected(false)
+            conn.cancel()   // handlePeerGone tears the session down and re-broadcasts
         }
         watchdog.resume()
         watchdogTimer = watchdog
     }
 
     /// JSON on the video channel (pong, ping liveness) — payloads starting '{'.
-    private func handleVideoChannelJSON(_ data: Data) {
+    private func handleVideoChannelJSON(_ data: Data, on conn: NWConnection) {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let type = obj["type"] as? String else { return }
         switch type {
@@ -822,9 +931,9 @@ final class StreamReceiver: ObservableObject {
                 self.onCursorImage?(image, anchor, normSize)
             }
         case WireMessage.welcome:
-            // The Mac identified itself (issue #132). If it speaks a protocol
-            // older than we support, it's the Mac that needs updating — and an
-            // old Mac can't diagnose that itself, so we surface it here.
+            // The Mac identified itself. A Mac below the floor is turned away
+            // outright: the token model has no legacy path, so an old peer must
+            // not be allowed to join the roster at all.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
@@ -832,7 +941,17 @@ final class StreamReceiver: ObservableObject {
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "The OpenDisplay app on your Mac is too old for this \(deviceKind) app. Update OpenDisplay on your Mac to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
+                conn.cancel()
+                return
             }
+            guard let macId = obj["macId"] as? String, !macId.isEmpty else {
+                Log.info("welcome without a macId — dropping the connection")
+                conn.cancel()
+                return
+            }
+            registerMac(macId: macId, name: obj["macName"] as? String ?? "Mac", on: conn)
+        case WireMessage.token:
+            handleTokenMessage(obj, on: conn)
         case WireMessage.streamConfig:
             // H.264 remains implicit for old senders. New senders announce the
             // operating point so future codecs never have to be guessed from
@@ -900,7 +1019,6 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func resetStreamState() {
-        buffer.removeAll(keepingCapacity: true)
         formatDesc = nil
         vps = nil
         sps = nil
@@ -1087,62 +1205,106 @@ final class StreamReceiver: ObservableObject {
     private func receive(on conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
             [weak self] data, _, isComplete, error in
-            // A replaced connection's last callback must not touch the
-            // session (its EOF used to flip `connected` off for the new one).
-            guard let self, conn === self.connection else { return }
+            guard let self else { return }
             if let data, !data.isEmpty {
-                self.lastDataReceived = Date()
-                self.bytesThisWindow += data.count
-                self.buffer.append(data)
-                self.drainFrames()
+                // Only the token holder's traffic counts for liveness/stats.
+                if conn === self.connection {
+                    self.lastDataReceived = Date()
+                    self.bytesThisWindow += data.count
+                }
+                var buf = self.buffers[ObjectIdentifier(conn)] ?? Data()
+                buf.append(data)
+                self.buffers[ObjectIdentifier(conn)] = buf
+                self.drainFrames(on: conn)
             }
             if let error {
                 Log.info("receive error: \(error)")
+                self.buffers[ObjectIdentifier(conn)] = nil
+                self.handlePeerGone(conn)
                 return
             }
             if isComplete {
                 Log.info("peer closed connection")
-                self.setConnected(false)
+                self.buffers[ObjectIdentifier(conn)] = nil
+                self.handlePeerGone(conn)
                 return
             }
             self.receive(on: conn)
         }
     }
 
-    private func drainFrames() {
+    /// Deframe one connection's buffered bytes. Control JSON is handled for every
+    /// Mac; audio and video are decoded only for the token holder. A waiting Mac
+    /// captures nothing, so anything binary it sent is dropped rather than fed to
+    /// the decoder — that is what keeps each Mac's session strictly isolated from
+    /// the others.
+    private func drainFrames(on conn: NWConnection) {
+        let key = ObjectIdentifier(conn)
+        // The token holder may actually be streaming on a twin socket (the
+        // Bonjour race can leave this side pointing at the other one). The
+        // socket that carries the stream is the real session — promote it.
+        if conn !== connection, let id = macId(for: conn), id == activeMacId {
+            Log.info("holder \(id.prefix(8)) is streaming on another socket — promoting it")
+            promoteToHolder(conn)
+        }
+        var buf = buffers[key] ?? Data()
         // Cursor-based drain so we only compact the buffer once per batch.
-        var cursor = buffer.startIndex
-        while buffer.distance(from: cursor, to: buffer.endIndex) >= 4 {
-            let raw = buffer[cursor..<buffer.index(cursor, offsetBy: 4)]
+        var cursor = buf.startIndex
+        while buf.distance(from: cursor, to: buf.endIndex) >= 4 {
+            let raw = buf[cursor..<buf.index(cursor, offsetBy: 4)]
                 .withUnsafeBytes { UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self)) }
             // The high bit tags a system-audio frame; video/JSON use the plain
-            // length. Audio is only sent to receivers that advertised support,
-            // so an older receiver never has to understand this.
+            // length.
             let isAudio = raw & 0x8000_0000 != 0
             let len = Int(raw & 0x7FFF_FFFF)
-            guard buffer.distance(from: cursor, to: buffer.endIndex) >= 4 + len else { break }
-            let start = buffer.index(cursor, offsetBy: 4)
-            let end = buffer.index(start, offsetBy: len)
-            let payload = Data(buffer[start..<end])
-            if isAudio {
-                onAudioFrame?(payload)
-            } else {
-                handleAnnexB(payload)
-            }
+            guard buf.distance(from: cursor, to: buf.endIndex) >= 4 + len else { break }
+            let start = buf.index(cursor, offsetBy: 4)
+            let end = buf.index(start, offsetBy: len)
+            let payload = Data(buf[start..<end])
             cursor = end
+            if conn === connection {
+                if isAudio {
+                    onAudioFrame?(payload)
+                } else {
+                    handleAnnexB(payload, on: conn)
+                }
+            } else {
+                // Not the current session socket. A waiting Mac sends only
+                // control JSON; a binary video frame here means the holder is
+                // streaming on this socket (the Bonjour dial race can leave the
+                // session pointing at its twin). Adopt it and decode the frame
+                // rather than dropping it, and only when the socket belongs to
+                // the holder or its identity is not yet known.
+                let knownId = macId(for: conn)
+                let looksLikeVideo = !isAudio
+                    && (payload.contains(0) || payload.first != UInt8(ascii: "{"))
+                if looksLikeVideo, connection == nil || knownId == nil || knownId == activeMacId {
+                    Log.info("holder streaming on a twin socket — adopting it")
+                    promoteToHolder(conn)
+                    handleAnnexB(payload, on: conn)
+                } else {
+                    handleControlPayload(payload, on: conn)
+                }
+            }
         }
-        buffer.removeSubrange(buffer.startIndex..<cursor)
+        buf.removeSubrange(buf.startIndex..<cursor)
+        buffers[key] = buf
+    }
+
+    /// Parse a control-only frame from a waiting Mac (welcome, token, ping/pong).
+    private func handleControlPayload(_ data: Data, on conn: NWConnection) {
+        handleVideoChannelJSON(data, on: conn)
     }
 
     // MARK: - Annex B -> CMSampleBuffer
 
-    private func handleAnnexB(_ data: Data) {
+    private func handleAnnexB(_ data: Data, on conn: NWConnection) {
         // Pure JSON payload = control message (pong, cursor sprite etc.).
         // Video frames also begin with '{' (telemetry prefix) but always
         // contain start codes — the null bytes make them unambiguous even
         // against multi-KB JSON (cursor sprites are base64, NUL-free).
         if data.count < 32_768, data.first == UInt8(ascii: "{"), !data.contains(0x00) {
-            handleVideoChannelJSON(data)
+            handleVideoChannelJSON(data, on: conn)
             return
         }
 

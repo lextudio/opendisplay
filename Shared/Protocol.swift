@@ -11,16 +11,21 @@ import Foundation
 /// protocol 1 — that's every install in the field that predates the handshake.
 enum WireProtocol {
     /// The protocol version this build speaks.
-    static let version = 3
+    static let version = 4
+
+    /// Protocol version that introduced multiple simultaneous Mac connections and
+    /// the playback **token** that arbitrates whose audio/video is forwarded.
+    static let tokenWireVersion = 4
 
     /// Protocol version that introduced Apple Pencil / proximity wire messages.
     /// Peers below this get pencil input as legacy `touch` events.
     static let pencilWireVersion = 3
 
-    /// Oldest peer protocol version this build still supports. Stays at 1
-    /// (support everything) until a deliberate two-phase breaking change
-    /// raises it — raising this is what turns "peer too old" into a hard gate.
-    static let minSupportedPeer = 1
+    /// Oldest peer protocol version this build still supports. The token feature
+    /// deliberately does not carry legacy peers: a Mac that cannot join the
+    /// roster and honour the token is turned away rather than allowed to evict
+    /// the holder the way the pre-token takeover model did.
+    static let minSupportedPeer = 4
 
     /// A peer that advertises no `pv` is defined as protocol 1.
     static let assumedWhenAbsent = 1
@@ -46,6 +51,28 @@ enum WireMessage {
     // channels and, for AAC, the decoder magic cookie). Additive: sent only to
     // receivers that advertised a codec list, so an old receiver keeps PCM.
     static let audioConfig = "audioConfig"
+
+    // ── Playback token (multi-Mac) ───────────────────────────────────────────
+    // Every Mac dials the receiver and registers in its roster, but only the Mac
+    // holding the playback token may send audio/video; the receiver drops those
+    // frames from everyone else while keeping their control channel alive.
+    //
+    // receiver -> all Macs: the current roster and token holder. Sent after every
+    //   registration, departure and token change.
+    static let roster = "roster"
+    // Mac -> receiver: token control. `action` is one of request/release/grant;
+    //   `grant` carries the target Mac id in `to`. Only the holder's release and
+    //   grant are honoured (the receiver checks the sender's macId); `request`
+    //   is advisory — the receiver never auto-transfers on it.
+    static let token = "token"
+}
+
+/// One Mac currently connected to the receiver, as carried in a `roster` message.
+struct PeerInfo: Codable, Equatable {
+    let id: String
+    let name: String
+    /// Whether this peer currently holds the playback token.
+    let active: Bool
 }
 
 /// One receiver-supported operating envelope. Every non-nil limit in an

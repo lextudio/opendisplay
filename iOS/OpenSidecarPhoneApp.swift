@@ -369,6 +369,33 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    if receiver.rosterSnapshot.isEmpty {
+                        Text("No Mac connected.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(receiver.rosterSnapshot, id: \.id) { peer in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(peer.name)
+                                Text(peer.active ? "Streaming to this \(deviceKind)" : "Waiting")
+                                    .font(.caption)
+                                    .foregroundStyle(peer.active ? .green : .secondary)
+                            }
+                            Spacer()
+                            if !peer.active {
+                                Button("Grant") { receiver.forceGrantToken(to: peer.id) }
+                                    .controlSize(.small)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Playback")
+                } footer: {
+                    Text("Every Mac stays connected, but only the one holding the playback token sends this \(deviceKind) audio and video. The holder can hand the token to another Mac; this list forces it to one you pick.")
+                }
+
+                Section {
                     // Isolated from the receiver: the Status section above
                     // re-renders on every stream update, and a TextField that
                     // rebuilds mid-tap loses focus (the "tap twice to edit"

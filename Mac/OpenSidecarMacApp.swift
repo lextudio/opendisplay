@@ -29,10 +29,29 @@ struct OpenSidecarMacApp: App {
         )) {
             ContentView(controller: controller, updater: appDelegate.updater)
         } label: {
-            Image(systemName: controller.running
-                  ? "rectangle.on.rectangle.fill" : "rectangle.on.rectangle")
+            // A cached NSImage per state, not a SwiftUI Image(systemName:). The
+            // conditional SF Symbol re-rendered on every SwiftUI pass, and AppKit
+            // re-snapshotted the status item continuously (`NSStatusItem
+            // _updateReplicants`, measured as a steady CPU drain). Handing back
+            // the same NSImage instance lets the snapshot cache hold.
+            Image(nsImage: MenuBarIcon.image(running: controller.running))
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+/// The menu bar glyph, cached so the status item is not re-rendered per pass.
+enum MenuBarIcon {
+    private static var cache: [Bool: NSImage] = [:]
+
+    static func image(running: Bool) -> NSImage {
+        if let cached = cache[running] { return cached }
+        let name = running ? "rectangle.on.rectangle.fill" : "rectangle.on.rectangle"
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: "OpenDisplay")
+            ?? NSImage()
+        image.isTemplate = true
+        cache[running] = image
+        return image
     }
 }
 
@@ -126,6 +145,10 @@ final class DeviceSession: ObservableObject, Identifiable {
     // error text remains. A failed session must never swallow a fresh
     // connect for its device the way a live one does.
     @Published var failed = false
+    // Multi-Mac roster and playback-token holder for this device (main thread,
+    // fed by MacSender.onRosterChanged).
+    @Published var peers: [PeerInfo] = []
+    @Published var holderId: String?
     // Receiver's per-install identity (from hello) — the key for recognizing
     // the same physical device across USB and WiFi.
     var deviceID: String?
@@ -685,6 +708,10 @@ final class SenderController: ObservableObject {
                                frameRate: frameRate,
                                codecPreference: videoCodec)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
+        sender.onRosterChanged = { [weak session] peers, holder in
+            session?.peers = peers
+            session?.holderId = holder
+        }
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
         }
@@ -1225,6 +1252,42 @@ struct SessionRow: View {
     @ObservedObject var session: DeviceSession
     let controller: SenderController
 
+    // Multi-Mac playback token: only the holder may capture. The holder can
+    // release or hand the token to another connected Mac from here.
+    @ViewBuilder private var tokenLine: some View {
+        if session.holderId == MacIdentity.id {
+            HStack(spacing: 6) {
+                Text("Streaming to this display")
+                    .font(.caption2).foregroundStyle(.green)
+                Button("Release") { session.sender.releaseToken() }
+                    .controlSize(.mini)
+                if !otherPeers.isEmpty {
+                    Menu("Transfer to") {
+                        ForEach(otherPeers, id: \.id) { peer in
+                            Button(peer.name) { session.sender.transferToken(to: peer.id) }
+                        }
+                    }
+                    .controlSize(.mini)
+                    .fixedSize()
+                }
+            }
+        } else if let holder = session.holderId, !holder.isEmpty {
+            Text("\(peerName(holder)) is streaming here")
+                .font(.caption2).foregroundStyle(.secondary)
+        } else if !session.peers.isEmpty {
+            Text("\(session.peers.count) Mac(s) connected — waiting for the playback token")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+
+    private var otherPeers: [PeerInfo] {
+        session.peers.filter { $0.id != MacIdentity.id }
+    }
+
+    private func peerName(_ id: String) -> String {
+        session.peers.first(where: { $0.id == id })?.name ?? "Another Mac"
+    }
+
     private var statusColor: Color {
         if session.status.hasPrefix("Extending") || session.status.hasPrefix("Mirroring")
             || session.status.hasPrefix("Connected") {
@@ -1247,6 +1310,7 @@ struct SessionRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                tokenLine
             }
             Spacer()
             if session.mbps > 0 {

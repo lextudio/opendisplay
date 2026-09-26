@@ -267,3 +267,22 @@ enum VideoCodecPreference: String, CaseIterable {
 enum VideoCodec: String {
     case h264, hevc
 }
+
+/// This Mac's stable identity in the receiver's multi-Mac roster. The id is
+/// generated once and kept in defaults, so the receiver can reserve the playback
+/// token for this Mac across reconnects even after it drops off.
+enum MacIdentity {
+    static let id: String = {
+        let key = "macId"
+        if let existing = UserDefaults.standard.string(forKey: key), !existing.isEmpty {
+            return existing
+        }
+        let generated = UUID().uuidString
+        UserDefaults.standard.set(generated, forKey: key)
+        return generated
+    }()
+
+    static let name: String = {
+        Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+    }()
+}

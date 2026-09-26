@@ -257,6 +257,8 @@ Coordinates use the conventions of section 7.
 | `stats` | pv 1 | free-form | Receiver-side telemetry for the sender's log |
 | `sleeping` | pv 2 | none | Device locked; session ends, reconnect on wake expected |
 | `closing` | pv 2 | none | App quit; session ends for good |
+| `roster` | pv 4 | `activeId`, `peers` | Connected Macs and the token holder (6.7) |
+| `token` | pv 4 | `activeId` | The playback token moved to another Mac (6.7) |
 
 **`hello`** MUST be the first message a receiver sends on every new
 connection, because the sender sizes its virtual display from it and can do
@@ -356,13 +358,14 @@ section 4.
 | `ping` | pv 1 | `drops`?, `encDrops`?, `netDrops`?, `pending`?, `inp50`?, `inp95`?, `capFps`? | Liveness + sender health |
 | `cursor` | pv 1 | `x`?, `y`?, `v` | Cursor position/visibility |
 | `cursorImg` | pv 1 | `nw`, `nh`, `ax`, `ay`, `png` | Cursor sprite |
-| `welcome` | pv 2 | `pv`, `min` | Sender's side of the version handshake |
+| `welcome` | pv 2 (pv 4 adds identity) | `pv`, `min`, `macId`, `macName` | Sender's version handshake + roster identity |
 | `updateRequired` | pv 2 | `target`, `store`, `message` | Peer must update to continue |
 | `streamConfig` | pv 3 (additive) | `codec`, `width`, `height`, `framesPerSecond` | Selected video operating point |
 | `audioConfig` | pv 3 (additive) | `codec`, `sampleRate`, `channels`, `cookie`? | Forwarded-audio operating point (6.6) |
 | `audioVolume` | pv 3 (additive) | `v` | Forwarded-audio playback gain (6.6) |
 | `hostSleeping` | pv 3 (additive) | `displaySleepAfter`? | Host screen locked / going to sleep (6.6) |
 | `hostAwake` | pv 3 (additive) | — | Host woke; restore the receiver's display (6.6) |
+| `token` | pv 4 | `action` (`request`/`release`/`grant`), `to`? | Sender's token control (6.7) |
 
 **`pong`** echoes the `t` from the receiver's `ping` unchanged and adds
 `mt`: milliseconds since the Unix epoch on the sender's clock at the moment
@@ -595,6 +598,40 @@ During migration, a receiver MAY send both the legacy ceiling and
 do not replace sender validation: the sender must independently keep its H.264
 raster and rate within the selected encoder's constraints.
 
+### 6.7 Multi-Mac roster and the playback token
+
+The receiver accepts connections from several Macs at once. Each Mac identifies
+itself in `welcome` with a stable `macId` (persisted) and a human `macName`, and
+is registered in the receiver's **roster**. However many Macs are connected, only
+one may send audio/video: it holds the **playback token**.
+
+- The **first Mac to register** takes the token. Later Macs join the roster and
+  wait; their audio/video frames (they should send none) are dropped while their
+  control channel stays open.
+- The receiver broadcasts `roster` (`activeId` plus one entry per connected Mac,
+  each with an `active` flag) after every registration, departure and token
+  change, and `token` (`activeId`) whenever the holder changes, so every Mac can
+  show the receiver, its peers, and which one is streaming.
+- **Transfers are the holder's decision.** A holder sends
+  `token {action:"grant", to:"<macId>"}` to hand the token to another connected
+  Mac, or `token {action:"release"}` to give it up (no holder until one is
+  granted). `request` is advisory only — the receiver never auto-transfers on it.
+  The receiver honours `release`/`grant` only from the current holder.
+- **Forcing a transfer** is done on the receiver itself: its UI can grant the
+  token to any connected Mac.
+- **A holder that disconnects keeps the token reserved** for its `macId`; the
+  receiver does not auto-failover. It gets the token back on reconnect.
+- On a transfer the receiver notifies the receiving Mac, which starts its capture
+  and forwards audio/video from that point; the previous holder tears its stream
+  down but stays connected as a waiting peer.
+- Each Mac's session state is isolated: promoting a new holder resets the
+  decoder, cursor and forwarded-audio state, so one Mac never inherits another's
+  format or cursor.
+
+Input (`touch`, `scroll`, `pencil`, `proximity`) is sent only to the token
+holder. Peers below `pv` 4 are refused, because the pre-token takeover model is
+incompatible with a single, explicitly-arbitrated stream.
+
 ## 7. Coordinate spaces and units
 
 The most common third-party bug is a unit mismatch, so here is every space
@@ -734,6 +771,7 @@ Mechanics at a glance (the policy behind them lives in COMPATIBILITY.md):
 | 3 (additive) | `hello.cursorPort` and the UDP cursor side channel (6.3); optional, no bump |
 | 3 (additive) | `hello.videoCaps`, `displayMaxFrameRate`, and `streamConfig` (6.5); legacy peers remain implicit H.264 |
 | 3 (additive) | HEVC in `videoCaps`/`streamConfig`; forwarded system audio: `hello.audio`, `audioConfig`, `audioVolume`, `hostSleeping`, `hostAwake` (6.6) |
+| 4 | Multiple Macs per receiver with a playback **token** (6.7): `welcome.macId`/`macName`, `roster`, `token`. `minSupportedPeer` is raised to 4, so pre-token peers are refused rather than allowed to take over the session. |
 | 4 (reserved) | Typed frame header replacing the section 4 demux heuristic (two-phase migration) |
 
 ---

@@ -148,6 +148,102 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
+    // ── Multi-Mac playback token ─────────────────────────────────────────────
+    // The receiver arbitrates: only the Mac whose id equals `holderMacId` may
+    // capture. This Mac waits for the grant before starting, and tears the
+    // stream down (keeping the connection) if the token is moved away.
+    private var holderMacId: String?
+    private var tokenGranted = false
+    private var peerRoster: [PeerInfo] = []
+    private var tokenWaitContinuation: CheckedContinuation<Void, Never>?
+    private var tokenLossContinuation: CheckedContinuation<Void, Never>?
+    /// Roster + current holder for the app UI (delivered on the main thread).
+    var onRosterChanged: (([PeerInfo], String?) -> Void)?
+
+    /// Transfer the held token to another Mac (no-op unless this Mac holds it).
+    func transferToken(to macId: String) {
+        queue.async { [weak self] in
+            guard let self, self.tokenGranted else { return }
+            self.sendJSONFrame("{\"type\":\"\(WireMessage.token)\",\"action\":\"grant\",\"to\":\"\(macId)\"}")
+        }
+    }
+
+    /// Give the token up without naming a successor.
+    func releaseToken() {
+        queue.async { [weak self] in
+            guard let self, self.tokenGranted else { return }
+            self.sendJSONFrame("{\"type\":\"\(WireMessage.token)\",\"action\":\"release\"}")
+        }
+    }
+
+    private func waitForTokenGrant() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            queue.async {
+                if self.stopped || self.tokenGranted {
+                    cont.resume()
+                } else {
+                    self.tokenWaitContinuation = cont
+                }
+            }
+        }
+    }
+
+    private func waitForTokenLoss() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            queue.async {
+                if self.stopped || !self.tokenGranted {
+                    cont.resume()
+                } else {
+                    self.tokenLossContinuation = cont
+                }
+            }
+        }
+    }
+
+    /// Apply a receiver token update. Runs on `queue`.
+    private func applyToken(_ activeId: String?) {
+        holderMacId = activeId
+        let granted = activeId == MacIdentity.id
+        if granted != tokenGranted {
+            tokenGranted = granted
+            if granted {
+                Log.info("granted the playback token")
+                tokenWaitContinuation?.resume()
+                tokenWaitContinuation = nil
+            } else {
+                Log.info("playback token moved to another Mac — releasing the stream")
+                tokenLossContinuation?.resume()
+                tokenLossContinuation = nil
+            }
+        }
+        publishRoster()
+    }
+
+    private func applyRoster(_ peers: [PeerInfo]) {
+        peerRoster = peers
+        publishRoster()
+    }
+
+    private func publishRoster() {
+        let peers = peerRoster
+        let holder = holderMacId
+        Task { @MainActor in self.onRosterChanged?(peers, holder) }
+    }
+
+    /// Stop streaming after the token was moved away, keeping the connection so
+    /// this Mac stays a roster peer and can be granted again.
+    private func tearDownStreamingForTokenLoss() async {
+        await status("Stream released — waiting for the next Mac…")
+        invalidateCapturePipeline(discardingLastFrame: true)
+        if let stream { try? await stream.stopCapture() }
+        stream = nil
+        if let encoder { VTCompressionSessionInvalidate(encoder) }
+        encoder = nil
+        virtualDisplay = nil
+        cancelDropReplayTimer()
+        queue.async { self.captureRecoveryFailures = 0 }
+    }
+
     // The dial target. Written on `queue` only (after init): the controller
     // can migrate a live session between transports via switchTransport.
     private var transport: SenderTransport
@@ -516,29 +612,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("Screen Recording permission granted")
         }
 
-        switch mode {
-        case .mirror:
-            // Mirror also waits for hello so receiver capabilities are applied
-            // before the first encoder is created. Legacy receivers omit the
-            // new fields and retain the existing H.264 behavior.
-            let info = try await waitForHello()
-            let content = try await SCShareableContent.current
-            guard let display = content.displays.first else {
-                throw NSError(domain: "MacSender", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "no displays found"])
-            }
-            // SCDisplay.width/height are POINTS. Capturing at points on a
-            // Retina panel discards half the raster before the encoder ever
-            // sees it, and no quality setting can bring it back — read the
-            // true pixel size from the active display mode.
-            let displayMode = CGDisplayCopyDisplayMode(display.displayID)
-            let pixelsW = displayMode?.pixelWidth ?? display.width
-            let pixelsH = displayMode?.pixelHeight ?? display.height
-            try await startCapture(display: display,
-                                   sourcePixelsWide: pixelsW, sourcePixelsHigh: pixelsH,
-                                   receiver: info)
-
-        case .extend:
+        if mode == .extend {
             // awaitingWake is queue-confined — read it there before surfacing.
             queue.async { [weak self] in
                 guard let self else { return }
@@ -547,22 +621,60 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     : "Waiting for the device to connect…"
                 Task { await self.status(text) }
             }
-            let info = try await waitForHello()
-            try await setupExtend(info)
+        }
+        // Mirror also waits for hello so receiver capabilities are applied
+        // before the first encoder is created.
+        let info = try await waitForHello()
 
-            // Touch back-channel (Milestone 3). Needs Accessibility trust;
-            // streaming works without it, so don't interrupt with a prompt —
-            // the permission panel's Grant button asks when the user is ready.
-            if !AXIsProcessTrusted() {
-                await status("Extending — grant Accessibility for touch input")
-                // Event posting is trust-checked per-post, so it starts working
-                // the moment the user grants — poll just to log/report it.
-                while !AXIsProcessTrusted() {
-                    try await Task.sleep(for: .seconds(2))
-                    if stopped { return }
+        // Multi-Mac playback token: only the holder may capture. A waiting Mac
+        // stays connected (it is still a roster peer) and starts the moment the
+        // receiver grants it; if the token is moved away later, the stream is
+        // torn down and the wait resumes.
+        var accessibilityChecked = false
+        while !stopped {
+            await waitForTokenGrant()
+            if stopped { break }
+
+            switch mode {
+            case .mirror:
+                let content = try await SCShareableContent.current
+                guard let display = content.displays.first else {
+                    throw NSError(domain: "MacSender", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "no displays found"])
                 }
-                Log.info("Accessibility permission granted — touch input live")
+                // SCDisplay.width/height are POINTS. Capturing at points on a
+                // Retina panel discards half the raster before the encoder ever
+                // sees it, and no quality setting can bring it back — read the
+                // true pixel size from the active display mode.
+                let displayMode = CGDisplayCopyDisplayMode(display.displayID)
+                let pixelsW = displayMode?.pixelWidth ?? display.width
+                let pixelsH = displayMode?.pixelHeight ?? display.height
+                try await startCapture(display: display,
+                                       sourcePixelsWide: pixelsW, sourcePixelsHigh: pixelsH,
+                                       receiver: info)
+
+            case .extend:
+                try await setupExtend(info)
+
+                // Touch back-channel (Milestone 3). Needs Accessibility trust;
+                // streaming works without it, so don't interrupt with a prompt —
+                // the permission panel's Grant button asks when the user is ready.
+                if !accessibilityChecked {
+                    accessibilityChecked = true
+                    if !AXIsProcessTrusted() {
+                        await status("Extending — grant Accessibility for touch input")
+                        while !AXIsProcessTrusted() {
+                            try await Task.sleep(for: .seconds(2))
+                            if stopped { return }
+                        }
+                        Log.info("Accessibility permission granted — touch input live")
+                    }
+                }
             }
+
+            await waitForTokenLoss()
+            if stopped { break }
+            await tearDownStreamingForTokenLoss()
         }
     }
 
@@ -1119,6 +1231,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // Unblock a start() that is still waiting for the hello.
             self?.helloContinuation?.resume(throwing: CancellationError())
             self?.helloContinuation = nil
+            self?.tokenWaitContinuation?.resume()
+            self?.tokenWaitContinuation = nil
+            self?.tokenLossContinuation?.resume()
+            self?.tokenLossContinuation = nil
         }
     }
 
@@ -2275,6 +2391,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // periodic keyframes are off) — force an IDR on the next frame.
             Log.info("phone requested keyframe")
             needsKeyframe = true
+        case WireMessage.roster:
+            applyRoster((obj["peers"] as? [[String: Any]] ?? []).compactMap {
+                guard let id = $0["id"] as? String, let name = $0["name"] as? String else { return nil }
+                return PeerInfo(id: id, name: name, active: $0["active"] as? Bool ?? false)
+            })
+            if let ids = obj["peers"] as? [[String: Any]] {
+                Log.info("ROSTER activeId=\((obj["activeId"] as? String)?.prefix(8) ?? "-") "
+                         + "peers=\(ids.map { (($0["id"] as? String)?.prefix(8)).map(String.init) ?? "?" })")
+            }
+        case WireMessage.token:
+            let activeId = obj["activeId"] as? String
+            Log.info("TOKEN activeId=\(activeId?.prefix(8) ?? "nil") mine=\(MacIdentity.id.prefix(8))")
+            applyToken(activeId)
         case WireMessage.sleeping:
             // The device locked and is about to close on us. Hand the
             // session to the controller right away: it tears the virtual
@@ -2891,10 +3020,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// start codes; the receiver routes payloads starting with '{'.
     // MARK: - Version handshake (issue #132)
 
-    /// Identify ourselves to the receiver: our protocol version and the oldest
-    /// receiver version we still support.
+    /// Identify ourselves to the receiver: our protocol version, the oldest
+    /// receiver version we still support, and the stable id/name that place this
+    /// Mac in the receiver's multi-Mac roster and token arbitration.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer)}")
+        let payload: [String: Any] = [
+            "type": WireMessage.welcome,
+            "pv": WireProtocol.version,
+            "min": WireProtocol.minSupportedPeer,
+            "macId": MacIdentity.id,
+            "macName": MacIdentity.name,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else { return }
+        sendJSONFrame(json)
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the
